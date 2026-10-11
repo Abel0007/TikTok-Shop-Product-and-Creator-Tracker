@@ -65,9 +65,26 @@ def normalize_start_items(raw_start_urls: Any) -> List[Dict[str, Any]]:
 def choose_label_for_url(url: str, explicit_userdata: Dict[str, Any]) -> Dict[str, Any]:
     if explicit_userdata and explicit_userdata.get("label"):
         return explicit_userdata
+
     lower = url.lower()
-    if "tag" in lower or "shop" in lower or "collections" in lower:
+
+    # TikTok Shop product pages
+    if (
+        "/shop/pdp/" in lower
+        or "/shop/product/" in lower
+        or "/product/" in lower
+        or "/item/" in lower
+    ):
+        return {"label": PRODUCT_LABEL}
+
+    # Listing / discovery pages
+    if (
+        "/tag/" in lower
+        or "/collections/" in lower
+        or "/shop/" in lower
+    ):
         return {"label": LISTING_LABEL}
+
     return {"label": PRODUCT_LABEL}
 
 
