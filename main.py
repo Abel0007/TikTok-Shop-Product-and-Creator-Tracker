@@ -44,6 +44,7 @@ PRODUCT_URL_MARKERS = (
 
 DEFAULT_FALLBACK_ACTOR_ID = "jungle_synthesizer/tiktok-shop-product-detail-scraper"
 DEFAULT_SEARCH_ACTOR_ID = "getanyapi/tiktok-shop-scraper"
+DEFAULT_DETAIL_ACTOR_ID = "cunning_soil/tiktok-shop-product-scraper-mobile-api"
 
 
 # ---------------------
@@ -1331,6 +1332,295 @@ async def worker_loop(
 
 
 
+
+# ---------------------
+# Mobile detail enrichment
+# ---------------------
+
+def parse_money_text(value: Any) -> Optional[float]:
+    """Extract a numeric amount from values such as '€18,84' or '$59.99'."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    # Keep digits, decimal separators and minus sign only.
+    cleaned = re.sub(r"[^0-9,.\-]", "", raw)
+
+    if not cleaned:
+        return None
+
+    # German/European decimal notation.
+    if "," in cleaned and "." not in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    elif "," in cleaned and "." in cleaned:
+        # Decide decimal separator by the last separator.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def find_first_text_by_keys(
+    value: Any,
+    keys: tuple[str, ...],
+) -> Optional[str]:
+    """
+    Recursively find the first non-empty string under one of the exact keys.
+    This is intentionally conservative so we do not invent a description.
+    """
+    if isinstance(value, dict):
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        for child in value.values():
+            found = find_first_text_by_keys(child, keys)
+            if found:
+                return found
+
+    elif isinstance(value, list):
+        for child in value:
+            found = find_first_text_by_keys(child, keys)
+            if found:
+                return found
+
+    return None
+
+
+def extract_mobile_detail_product(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Extract the first product from the mobile Actor's full_readable output.
+    The Actor returns a wrapper with product_info.products.
+    """
+    product_info = raw.get("product_info")
+
+    if not isinstance(product_info, dict):
+        return None
+
+    products = product_info.get("products")
+
+    if not isinstance(products, list) or not products:
+        return None
+
+    first = products[0]
+
+    return first if isinstance(first, dict) else None
+
+
+def merge_mobile_detail_into_product(
+    product: Dict[str, Any],
+    raw: Dict[str, Any],
+    detail_actor_id: str,
+) -> None:
+    """Merge verified detail fields into the existing search result."""
+    detail = extract_mobile_detail_product(raw)
+
+    if detail is None:
+        product["detailStatus"] = "NO_PRODUCT_IN_RESPONSE"
+        return
+
+    product["detailStatus"] = "AVAILABLE"
+    product["detailSource"] = detail_actor_id
+
+    if detail.get("product_id") is not None:
+        product["productId"] = str(detail.get("product_id"))
+
+    if detail.get("title"):
+        product["title"] = detail.get("title")
+
+    category = detail.get("category")
+    if isinstance(category, dict):
+        if category.get("name"):
+            product["categoryName"] = category.get("name")
+        if category.get("id") is not None:
+            product["categoryId"] = str(category.get("id"))
+
+    pricing = detail.get("pricing")
+    if isinstance(pricing, dict):
+        sale_price_text = pricing.get("sale_price")
+        original_price_text = pricing.get("original_price")
+        currency = pricing.get("currency")
+
+        product["priceText"] = sale_price_text
+        product["originalPriceText"] = original_price_text
+
+        parsed_sale = parse_money_text(sale_price_text)
+        parsed_original = parse_money_text(original_price_text)
+
+        if parsed_sale is not None:
+            # Replace ambiguous search-provider price with detail price.
+            product["price"] = parsed_sale
+            product["priceSource"] = detail_actor_id
+
+        if parsed_original is not None:
+            product["originalPrice"] = parsed_original
+
+        if currency:
+            product["currency"] = currency
+
+        if (
+            parsed_sale is not None
+            and parsed_original is not None
+            and parsed_original > 0
+            and parsed_original > parsed_sale
+        ):
+            product["discountPercent"] = round(
+                ((parsed_original - parsed_sale) / parsed_original) * 100,
+                2,
+            )
+
+    sales = detail.get("sales")
+    if isinstance(sales, dict) and sales.get("sold_count") is not None:
+        product["soldCount"] = sales.get("sold_count")
+
+    inventory = detail.get("inventory")
+    if isinstance(inventory, dict):
+        if inventory.get("total_stock") is not None:
+            product["totalStock"] = inventory.get("total_stock")
+
+        skus = inventory.get("skus")
+        if isinstance(skus, list):
+            product["skus"] = skus
+
+    media = detail.get("media")
+    if isinstance(media, dict):
+        image_urls = media.get("image_urls")
+        if isinstance(image_urls, list) and image_urls:
+            product["images"] = image_urls
+            product["image"] = image_urls[0]
+
+    seller = detail.get("seller")
+    if isinstance(seller, dict):
+        if seller.get("name"):
+            product["shopName"] = seller.get("name")
+        if seller.get("seller_id") is not None:
+            product["sellerId"] = str(seller.get("seller_id"))
+        if seller.get("rating") is not None:
+            product["shopRating"] = seller.get("rating")
+        if seller.get("location"):
+            product["sellerLocation"] = seller.get("location")
+
+    # Best-effort product description from any explicit description field
+    # exposed in the readable/raw product payload. If none exists, leave null.
+    description = find_first_text_by_keys(
+        detail,
+        (
+            "description",
+            "product_description",
+            "productDescription",
+            "description_text",
+            "desc",
+        ),
+    )
+
+    if description:
+        product["description"] = description
+        product["descriptionStatus"] = "AVAILABLE_MOBILE_API"
+    elif product.get("description"):
+        product["descriptionStatus"] = "AVAILABLE_SEARCH_PROVIDER"
+    else:
+        product["descriptionStatus"] = "NOT_AVAILABLE"
+
+
+async def enrich_products_with_mobile_details(
+    products: List[Dict[str, Any]],
+    max_products: int,
+    region: str,
+    detail_actor_id: str,
+    log,
+) -> None:
+    """
+    Enrich up to max_products using a mobile TikTok Shop product API Actor.
+    This avoids browser CAPTCHA / Security Check pages.
+    """
+    if max_products <= 0:
+        return
+
+    candidates = [
+        product
+        for product in products
+        if product.get("productId") or product.get("productUrl")
+    ][:max_products]
+
+    if not candidates:
+        log.info("[DETAIL] No products available for mobile detail enrichment.")
+        return
+
+    log.info(
+        f"[DETAIL] Enriching {len(candidates)} products with {detail_actor_id}."
+    )
+
+    for index, product in enumerate(candidates, start=1):
+        product_input = (
+            str(product.get("productId"))
+            if product.get("productId")
+            else str(product.get("productUrl"))
+        )
+
+        run_input = {
+            "productInput": product_input,
+            "region": region.upper(),
+            "outputMode": "full_readable",
+        }
+
+        try:
+            log.info(
+                f"[DETAIL] ({index}/{len(candidates)}) "
+                f"product={product_input}, region={region.upper()}"
+            )
+
+            run = await Actor.call(
+                actor_id=detail_actor_id,
+                run_input=run_input,
+            )
+
+            if run is None:
+                product["detailStatus"] = "ERROR"
+                product["detailError"] = "Detail Actor failed to start."
+                continue
+
+            run_client = Actor.apify_client.run(run.id)
+            dataset_client = run_client.dataset()
+            page = await dataset_client.list_items(limit=1)
+            items = page.items or []
+
+            if not items or not isinstance(items[0], dict):
+                product["detailStatus"] = "NO_RESULT"
+                product["detailError"] = "Detail Actor returned no dataset item."
+                continue
+
+            merge_mobile_detail_into_product(
+                product=product,
+                raw=items[0],
+                detail_actor_id=detail_actor_id,
+            )
+
+            log.info(
+                f"[DETAIL] ({index}/{len(candidates)}) "
+                f"status={product.get('detailStatus')}, "
+                f"title={product.get('title')!r}"
+            )
+
+        except Exception as exc:
+            product["detailStatus"] = "ERROR"
+            product["detailError"] = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                f"[DETAIL] Failed for {product_input}: {product['detailError']}"
+            )
+
+
 # ---------------------
 # Search result screenshot enrichment
 # ---------------------
@@ -1346,12 +1636,16 @@ async def enrich_search_products_with_screenshots(
     debug: bool = False,
 ) -> None:
     """
-    Open up to max_screenshots product URLs from search results, capture a
-    full-page screenshot, and enrich the result with page metadata.
+    Attempt full-page screenshots for up to five search results.
 
-    Best-effort only: if TikTok returns a Security Check, the screenshot is
-    still stored and the result is marked SECURITY_CHECK.
+    Important:
+    - If TikTok returns a Security Check / CAPTCHA, we DO NOT store the blank
+      screenshot as a successful product screenshot.
+    - The result is marked SECURITY_CHECK and keeps the product image URL from
+      the search/mobile data as fallback visual evidence.
     """
+    max_screenshots = max(0, min(5, int(max_screenshots)))
+
     if max_screenshots <= 0:
         return
 
@@ -1366,7 +1660,7 @@ async def enrich_search_products_with_screenshots(
         return
 
     log.info(
-        f"[SCREENSHOT] Capturing {len(candidates)} full-page product screenshots."
+        f"[SCREENSHOT] Attempting {len(candidates)} full-page product screenshots."
     )
 
     async with async_playwright() as playwright:
@@ -1381,8 +1675,19 @@ async def enrich_search_products_with_screenshots(
         try:
             for index, product in enumerate(candidates, start=1):
                 url = str(product.get("productUrl") or "").strip()
+
                 if not url:
                     continue
+
+                product["fallbackVisualUrl"] = (
+                    product.get("image")
+                    or (
+                        product.get("images")[0]
+                        if isinstance(product.get("images"), list)
+                        and product.get("images")
+                        else None
+                    )
+                )
 
                 proxy_url: Optional[str] = None
 
@@ -1405,10 +1710,11 @@ async def enrich_search_products_with_screenshots(
                         proxy_url=proxy_url,
                         use_mobile=True,
                     )
+
                     page = await context.new_page()
 
                     log.info(
-                        f"[SCREENSHOT] ({index}/{len(candidates)}) {url}"
+                        f"[SCREENSHOT] ({index}/{len(candidates)}) Opening {url}"
                     )
 
                     response = await page.goto(
@@ -1427,7 +1733,16 @@ async def enrich_search_products_with_screenshots(
                     except Exception:
                         page_title = None
 
+                    product["pageTitle"] = page_title
+                    product["screenshotHttpStatus"] = (
+                        response.status
+                        if response is not None
+                        else None
+                    )
+                    product["screenshotFinalUrl"] = page.url
+
                     normalized_title = (page_title or "").strip().lower()
+
                     challenge_markers = (
                         "security check",
                         "verify to continue",
@@ -1440,6 +1755,46 @@ async def enrich_search_products_with_screenshots(
                         for marker in challenge_markers
                     )
 
+                    if blocked:
+                        product["screenshotStatus"] = "SECURITY_CHECK"
+                        product["screenshotKey"] = None
+
+                        # Do not overwrite a good description collected from
+                        # the mobile detail Actor.
+                        if not product.get("description"):
+                            product["descriptionStatus"] = (
+                                "NOT_AVAILABLE_SECURITY_CHECK"
+                            )
+
+                        log.warning(
+                            f"[SCREENSHOT] Security Check for {url}; "
+                            f"blank screenshot was NOT stored."
+                        )
+
+                        if debug:
+                            try:
+                                html_key = stable_key(
+                                    "security-check-debug",
+                                    str(product.get("productId") or url),
+                                    "html",
+                                )
+
+                                await kv_store.set_value(
+                                    html_key,
+                                    await page.content(),
+                                    content_type="text/html",
+                                )
+
+                                product["debugHtmlKey"] = html_key
+                            except Exception as exc:
+                                log.warning(
+                                    f"[SCREENSHOT] Security debug HTML failed: {exc}"
+                                )
+
+                        continue
+
+                    # The real product page loaded. Try to extract description
+                    # directly from the page without inventing anything.
                     page_description = (
                         await get_meta_content(
                             page,
@@ -1466,15 +1821,18 @@ async def enrich_search_products_with_screenshots(
                             or page_description
                         )
 
+                    if product.get("description"):
+                        product["descriptionStatus"] = "AVAILABLE_PRODUCT_PAGE"
+                    elif not product.get("descriptionStatus"):
+                        product["descriptionStatus"] = "NOT_FOUND"
+
                     screenshot_key = stable_key(
                         "search-product",
                         str(product.get("productId") or url),
                         "png",
                     )
 
-                    screenshot = await page.screenshot(
-                        full_page=True
-                    )
+                    screenshot = await page.screenshot(full_page=True)
 
                     await kv_store.set_value(
                         screenshot_key,
@@ -1483,31 +1841,10 @@ async def enrich_search_products_with_screenshots(
                     )
 
                     product["screenshotKey"] = screenshot_key
-                    product["screenshotStatus"] = (
-                        "SECURITY_CHECK"
-                        if blocked
-                        else "PRODUCT_PAGE"
-                    )
-                    product["screenshotHttpStatus"] = (
-                        response.status
-                        if response is not None
-                        else None
-                    )
-                    product["screenshotFinalUrl"] = page.url
-                    product["pageTitle"] = page_title
-
-                    if blocked:
-                        product["descriptionStatus"] = (
-                            "UNAVAILABLE_SECURITY_CHECK"
-                        )
-                    elif product.get("description"):
-                        product["descriptionStatus"] = "AVAILABLE"
-                    else:
-                        product["descriptionStatus"] = "NOT_FOUND"
+                    product["screenshotStatus"] = "PRODUCT_PAGE"
 
                     log.info(
-                        f"[SCREENSHOT] Saved kv://{screenshot_key} "
-                        f"status={product['screenshotStatus']}"
+                        f"[SCREENSHOT] Saved real product page kv://{screenshot_key}"
                     )
 
                     if debug:
@@ -1517,11 +1854,13 @@ async def enrich_search_products_with_screenshots(
                                 str(product.get("productId") or url),
                                 "html",
                             )
+
                             await kv_store.set_value(
                                 html_key,
                                 await page.content(),
                                 content_type="text/html",
                             )
+
                             product["debugHtmlKey"] = html_key
                         except Exception as exc:
                             log.warning(
@@ -1530,9 +1869,11 @@ async def enrich_search_products_with_screenshots(
 
                 except Exception as exc:
                     product["screenshotStatus"] = "ERROR"
+                    product["screenshotKey"] = None
                     product["screenshotError"] = (
                         f"{type(exc).__name__}: {exc}"
                     )
+
                     log.warning(
                         f"[SCREENSHOT] Failed for {url}: "
                         f"{product['screenshotError']}"
@@ -1734,6 +2075,42 @@ async def main() -> None:
                 sort_by=sort_by,
             )
 
+            enrich_search_details = bool(
+                input_data.get(
+                    "enrichSearchDetails",
+                    True,
+                )
+            )
+
+            max_detail_products = max(
+                0,
+                min(
+                    5,
+                    int(
+                        input_data.get(
+                            "maxDetailProducts",
+                            5,
+                        )
+                    ),
+                ),
+            )
+
+            detail_actor_id = str(
+                input_data.get(
+                    "detailActorId",
+                    DEFAULT_DETAIL_ACTOR_ID,
+                )
+            ).strip() or DEFAULT_DETAIL_ACTOR_ID
+
+            if enrich_search_details and filtered_products:
+                await enrich_products_with_mobile_details(
+                    products=filtered_products,
+                    max_products=max_detail_products,
+                    region=region,
+                    detail_actor_id=detail_actor_id,
+                    log=log,
+                )
+
             capture_search_screenshots = bool(
                 input_data.get(
                     "captureSearchScreenshots",
@@ -1807,6 +2184,9 @@ async def main() -> None:
                     "productsReceived": len(search_products),
                     "uniqueProducts": len(deduped),
                     "productsSaved": len(filtered_products),
+                    "enrichSearchDetails": enrich_search_details,
+                    "maxDetailProducts": max_detail_products,
+                    "detailActorId": detail_actor_id,
                     "captureSearchScreenshots": capture_search_screenshots,
                     "maxSearchScreenshots": max_search_screenshots,
                     "screenshotsAttempted": (
