@@ -410,28 +410,28 @@ async def main():
         kv_store = await KeyValueStore.open()
         request_queue = await Actor.open_request_queue()
 
-        added = 0
+                added = 0
 
-     for item in start_items:
-        url = item.get("url")
-        userData = item.get("userData", {}) or {}
+        for item in start_items:
+            url = item.get("url")
+            userData = item.get("userData", {}) or {}
 
-    if not userData.get("label"):
-        userData = choose_label_for_url(url, userData)
+            if not userData.get("label"):
+                userData = choose_label_for_url(url, userData)
 
-    label = userData.get("label") or PRODUCT_LABEL
+            label = userData.get("label") or PRODUCT_LABEL
 
-    request = Request.from_url(
-        url,
-        label=label,
-    )
+            request = Request.from_url(
+                url,
+                label=label,
+            )
 
-    await request_queue.add_request(request)
+            await request_queue.add_request(request)
 
-    added += 1
-    log.info(f"Queued start URL: {url} (label={label})")
+            added += 1
+            log.info(f"Queued start URL: {url} (label={label})")
 
-log.info(f"Added {added} start requests.")
+        log.info(f"Added {added} start requests.")
 
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
