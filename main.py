@@ -203,18 +203,19 @@ async def auto_scroll_page(page, scroll_step=1200, max_scrolls=12, wait_time_ms=
 # ---------------------
 # Tasks
 # ---------------------
-async def process_product_task(
+async def process_listing_task(
     browser: Browser,
-    req: Dict[str, Any],
+    req: Request,
     proxy_url: Optional[str],
     accept_language: str,
     region: str,
     timeouts: Dict[str, Any],
-    capture_screenshots: bool,
-    kv_store: KeyValueStore,
+    request_queue,
     log,
+    kv_store: KeyValueStore,
+    debug: bool = False,
 ):
-    url = req.get("url")
+    url = req.url
     log.info(f"[PRODUCT] {url}")
     context = await create_context_for_req(browser, accept_language, proxy_url, use_mobile=True)
     page: Page = await context.new_page()
