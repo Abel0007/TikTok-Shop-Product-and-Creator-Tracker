@@ -496,6 +496,56 @@ async def process_product_task(
 
         try:
             page_title = await page.title()
+            challenge_titles = {
+    "security check",
+    "verify to continue",
+    "verification",
+    "captcha",
+}
+
+normalized_title = (page_title or "").strip().lower()
+
+if normalized_title in challenge_titles:
+    log.warning(
+        f"[PRODUCT] TikTok security challenge detected: {url}"
+    )
+
+    await Actor.push_data({
+        "type": "blocked",
+        "sourceUrl": url,
+        "finalUrl": page.url,
+        "productId": extract_product_id(url),
+        "region": region,
+        "httpStatus": status,
+        "reason": "TIKTOK_SECURITY_CHECK",
+        "title": page_title,
+    })
+
+    if debug:
+        key = stable_key(
+            "security-check",
+            url,
+            "html",
+        )
+        await kv_store.set_value(
+            key,
+            await page.content(),
+            content_type="text/html",
+        )
+
+    if capture_screenshots:
+        key = stable_key(
+            "security-check",
+            url,
+            "png",
+        )
+        await kv_store.set_value(
+            key,
+            await page.screenshot(full_page=True),
+            content_type="image/png",
+        )
+
+    return
         except Exception:
             page_title = None
 
