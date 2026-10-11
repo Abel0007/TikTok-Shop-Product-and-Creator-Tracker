@@ -96,7 +96,7 @@
       "type": "string",
       "description": "Custom Accept-Language header to hint region and language in the browser context.",
       "editor": "textfield",
-      "default": "en-US,en;q=0.9"
+      "default": "de-DE,de;q=0.9,en;q=0.8"
     },
 
     "limits": {
