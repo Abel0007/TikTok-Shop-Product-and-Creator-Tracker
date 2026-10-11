@@ -324,7 +324,7 @@ async def worker_loop(
         req = await request_queue.fetch_next_request()
         if not req:
             break
-        label = (req.get("userData") or {}).get("label")
+        label = req.label
 
         proxy_url = None
         try:
