@@ -43,6 +43,7 @@ PRODUCT_URL_MARKERS = (
 )
 
 DEFAULT_FALLBACK_ACTOR_ID = "jungle_synthesizer/tiktok-shop-product-detail-scraper"
+DEFAULT_SEARCH_ACTOR_ID = "getanyapi/tiktok-shop-scraper"
 
 
 # ---------------------
@@ -449,6 +450,194 @@ async def auto_scroll_page(
             f"[SCROLL] finished at height={last_height}"
         )
 
+
+
+
+# ---------------------
+# Search provider (TikTok Shop DE / multi-market)
+# ---------------------
+
+def as_number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        cleaned = value.strip().replace("%", "").replace(" ", "")
+        if not cleaned:
+            return None
+
+        # Handle common German decimal notation only when unambiguous.
+        if "," in cleaned and "." not in cleaned:
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    return None
+
+
+def normalize_search_product(
+    raw: Dict[str, Any],
+    query: str,
+    provider_actor_id: str,
+    region: str,
+) -> Dict[str, Any]:
+    price = as_number(raw.get("price"))
+    original_price = as_number(raw.get("originalPrice"))
+
+    discount_percent: Optional[float] = None
+
+    if (
+        price is not None
+        and original_price is not None
+        and original_price > 0
+        and original_price > price
+    ):
+        discount_percent = round(
+            ((original_price - price) / original_price) * 100,
+            2,
+        )
+    else:
+        raw_discount = as_number(
+            raw.get("discountPercent")
+            if raw.get("discountPercent") is not None
+            else raw.get("discount")
+        )
+        if raw_discount is not None and 0 <= raw_discount <= 100:
+            discount_percent = round(raw_discount, 2)
+
+    return {
+        "type": "product",
+        "source": raw.get("source") or provider_actor_id,
+        "searchQuery": query,
+        "region": region.upper(),
+        "productId": str(raw.get("productId")) if raw.get("productId") is not None else None,
+        "title": raw.get("title"),
+        "price": price,
+        "originalPrice": original_price,
+        "discountPercent": discount_percent,
+        "currency": raw.get("currency"),
+        "soldCount": raw.get("soldCount"),
+        "rating": raw.get("rating"),
+        "reviewCount": raw.get("reviewCount"),
+        "shopName": raw.get("shopName"),
+        "sellerId": str(raw.get("sellerId")) if raw.get("sellerId") is not None else None,
+        "image": raw.get("image"),
+        "productUrl": raw.get("url"),
+    }
+
+
+def product_passes_filters(
+    product: Dict[str, Any],
+    only_discounted: bool,
+    min_discount: float,
+    min_sold: int,
+    min_rating: float,
+) -> bool:
+    discount = as_number(product.get("discountPercent")) or 0.0
+    sold = as_number(product.get("soldCount")) or 0.0
+    rating = as_number(product.get("rating")) or 0.0
+
+    if only_discounted and discount <= 0:
+        return False
+
+    if discount < min_discount:
+        return False
+
+    if sold < min_sold:
+        return False
+
+    if rating < min_rating:
+        return False
+
+    return True
+
+
+def sort_products(
+    products: List[Dict[str, Any]],
+    sort_by: str,
+) -> List[Dict[str, Any]]:
+    sort_by = (sort_by or "discount").lower()
+
+    if sort_by == "sold":
+        key = lambda p: (
+            as_number(p.get("soldCount")) or 0.0,
+            as_number(p.get("discountPercent")) or 0.0,
+        )
+    elif sort_by == "rating":
+        key = lambda p: (
+            as_number(p.get("rating")) or 0.0,
+            as_number(p.get("soldCount")) or 0.0,
+        )
+    else:
+        key = lambda p: (
+            as_number(p.get("discountPercent")) or 0.0,
+            as_number(p.get("soldCount")) or 0.0,
+        )
+
+    return sorted(products, key=key, reverse=True)
+
+
+async def call_search_provider(
+    query: str,
+    region: str,
+    max_items: int,
+    search_actor_id: str,
+    log,
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    search_input = {
+        "query": query,
+        "country": region.upper(),
+        "maxItems": max_items,
+    }
+
+    try:
+        log.info(
+            f"[SEARCH] Calling {search_actor_id} "
+            f"query={query!r}, country={region.upper()}, maxItems={max_items}"
+        )
+
+        run = await Actor.call(
+            actor_id=search_actor_id,
+            run_input=search_input,
+        )
+
+        if run is None:
+            return [], "Search Actor failed to start."
+
+        run_client = Actor.apify_client.run(run.id)
+        dataset_client = run_client.dataset()
+        page = await dataset_client.list_items(limit=max_items)
+        raw_items = page.items or []
+
+        products = [
+            normalize_search_product(
+                raw=item,
+                query=query,
+                provider_actor_id=search_actor_id,
+                region=region,
+            )
+            for item in raw_items
+            if isinstance(item, dict)
+        ]
+
+        log.info(
+            f"[SEARCH] {query!r}: received {len(products)} products"
+        )
+
+        return products, None
+
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        log.warning(f"[SEARCH] Failed for {query!r}: {message}")
+        return [], message
 
 
 # ---------------------
@@ -1156,6 +1345,206 @@ async def main() -> None:
         except Exception:
             pass
 
+        mode = str(
+            input_data.get("mode", "auto")
+        ).strip().lower()
+
+        if mode not in {"auto", "search", "product"}:
+            raise ValueError(
+                "mode must be one of: auto, search, product"
+            )
+
+        region = str(
+            input_data.get("region", "DE")
+        ).strip().upper() or "DE"
+
+        # ---------------------
+        # SEARCH MODE
+        # ---------------------
+
+        keywords = (
+            input_data.get("keywords")
+            or input_data.get("keyword")
+            or input_data.get("searchKeywords")
+            or []
+        )
+
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        tiktok_categories = (
+            input_data.get("tiktokCategories")
+            or []
+        )
+
+        search_queries: List[str] = []
+
+        for keyword in keywords:
+            value = str(keyword).strip()
+            if value:
+                search_queries.append(value)
+
+        # Category labels become broad search terms for the search provider.
+        category_query_map = {
+            "beauty": "Beauty",
+            "fashion": "Fashion",
+            "electronics": "Elektronik",
+            "home": "Haushalt",
+            "pets": "Tierbedarf",
+            "sports": "Sport",
+            "food": "Lebensmittel",
+            "baby": "Baby",
+            "health": "Gesundheit",
+        }
+
+        for category in tiktok_categories:
+            raw_category = str(category).strip()
+            if not raw_category:
+                continue
+
+            search_queries.append(
+                category_query_map.get(
+                    raw_category.lower(),
+                    raw_category,
+                )
+            )
+
+        # Deduplicate while preserving order.
+        search_queries = list(dict.fromkeys(search_queries))
+
+        run_search = (
+            mode in {"auto", "search"}
+            and bool(search_queries)
+        )
+
+        search_actor_id = str(
+            input_data.get(
+                "searchActorId",
+                DEFAULT_SEARCH_ACTOR_ID,
+            )
+        ).strip() or DEFAULT_SEARCH_ACTOR_ID
+
+        max_items = max(
+            1,
+            int(input_data.get("maxItems", 100)),
+        )
+
+        only_discounted = bool(
+            input_data.get("onlyDiscounted", False)
+        )
+
+        min_discount = float(
+            input_data.get("minDiscount", 0) or 0
+        )
+
+        min_sold = int(
+            input_data.get("minSold", 0) or 0
+        )
+
+        min_rating = float(
+            input_data.get("minRating", 0) or 0
+        )
+
+        sort_by = str(
+            input_data.get("sortBy", "discount")
+        ).strip().lower()
+
+        search_errors: List[Dict[str, str]] = []
+        search_products: List[Dict[str, Any]] = []
+
+        if run_search:
+            for query in search_queries:
+                products, error = await call_search_provider(
+                    query=query,
+                    region=region,
+                    max_items=max_items,
+                    search_actor_id=search_actor_id,
+                    log=log,
+                )
+
+                search_products.extend(products)
+
+                if error:
+                    search_errors.append(
+                        {
+                            "query": query,
+                            "error": error,
+                        }
+                    )
+
+            # Deduplicate by productId, otherwise URL, otherwise title.
+            deduped: Dict[str, Dict[str, Any]] = {}
+
+            for product in search_products:
+                identity = (
+                    product.get("productId")
+                    or product.get("productUrl")
+                    or product.get("title")
+                )
+
+                if not identity:
+                    continue
+
+                deduped[str(identity)] = product
+
+            filtered_products = [
+                product
+                for product in deduped.values()
+                if product_passes_filters(
+                    product=product,
+                    only_discounted=only_discounted,
+                    min_discount=min_discount,
+                    min_sold=min_sold,
+                    min_rating=min_rating,
+                )
+            ]
+
+            filtered_products = sort_products(
+                filtered_products,
+                sort_by=sort_by,
+            )
+
+            if filtered_products:
+                await Actor.push_data(
+                    filtered_products
+                )
+
+            await Actor.set_value(
+                "SEARCH_SUMMARY",
+                {
+                    "mode": mode,
+                    "region": region,
+                    "queries": search_queries,
+                    "searchActorId": search_actor_id,
+                    "productsReceived": len(search_products),
+                    "uniqueProducts": len(deduped),
+                    "productsSaved": len(filtered_products),
+                    "filters": {
+                        "onlyDiscounted": only_discounted,
+                        "minDiscount": min_discount,
+                        "minSold": min_sold,
+                        "minRating": min_rating,
+                        "sortBy": sort_by,
+                    },
+                    "errors": search_errors,
+                },
+            )
+
+            log.info(
+                f"[SEARCH] Finished: "
+                f"received={len(search_products)}, "
+                f"unique={len(deduped)}, "
+                f"saved={len(filtered_products)}"
+            )
+
+        # In explicit search mode, do not launch Playwright at all.
+        if mode == "search":
+            return
+
+        # ---------------------
+        # PRODUCT / DIRECT MODE
+        # ---------------------
+
         raw_start = (
             input_data.get("startUrls")
             or input_data.get("start_urls")
@@ -1167,7 +1556,7 @@ async def main() -> None:
             raw_start
         )
 
-        # Optional seller profile discovery.
+        # Seller and manual category URLs remain best-effort Playwright discovery.
         seller_handles = (
             input_data.get("sellerHandles")
             or []
@@ -1193,36 +1582,10 @@ async def main() -> None:
                 }
             )
 
-        # Optional category discovery.
-        tiktok_categories = (
-            input_data.get("tiktokCategories")
-            or []
-        )
-
         category_urls = (
             input_data.get("categoryUrls")
             or []
         )
-
-        for category in tiktok_categories:
-            slug = slugify_tiktok_category(
-                str(category)
-            )
-
-            if not slug:
-                continue
-
-            start_items.append(
-                {
-                    "url": (
-                        "https://www.tiktok.com/tag/"
-                        f"{slug}"
-                    ),
-                    "userData": {
-                        "label": LISTING_LABEL,
-                    },
-                }
-            )
 
         for url in category_urls:
             if not url:
@@ -1237,42 +1600,19 @@ async def main() -> None:
                 }
             )
 
-        # Optional keyword discovery.
-        keywords = (
-            input_data.get("keywords")
-            or input_data.get("keyword")
-            or input_data.get("searchKeywords")
-        )
-
-        search_template = input_data.get(
-            "searchUrlTemplate"
-        )
-
-        if keywords:
-            if isinstance(keywords, str):
-                keywords = [keywords]
-
-            for keyword in keywords:
-                if not keyword:
-                    continue
-
-                start_items.append(
-                    {
-                        "url": build_search_url_for_keyword(
-                            str(keyword),
-                            template=search_template,
-                        ),
-                        "userData": {
-                            "label": LISTING_LABEL,
-                        },
-                    }
-                )
-
+        # In auto mode, categories/keywords are handled by the search provider,
+        # so we deliberately do not turn them into TikTok /tag/ pages.
         if not start_items:
+            if run_search:
+                log.info(
+                    "[AUTO] Search completed and there are no direct "
+                    "product/listing URLs to process."
+                )
+                return
+
             log.warning(
-                "No product URLs, seller handles, "
-                "keywords, categories, or category URLs "
-                "were provided."
+                "No direct product URLs, seller handles, "
+                "or category URLs were provided."
             )
             return
 
@@ -1283,11 +1623,6 @@ async def main() -> None:
         accept_language = input_data.get(
             "acceptLanguage",
             "de-DE,de;q=0.9,en;q=0.8",
-        )
-
-        region = input_data.get(
-            "region",
-            "DE",
         )
 
         capture_screenshots = bool(
@@ -1383,13 +1718,10 @@ async def main() -> None:
             )
 
         log.info(
-            f"Added {added} start requests."
+            f"Added {added} direct requests."
         )
 
         if added == 0:
-            log.warning(
-                "No valid requests were added."
-            )
             return
 
         async with async_playwright() as playwright:
