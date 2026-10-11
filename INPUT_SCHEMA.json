@@ -36,6 +36,20 @@
       "minimum": 1,
       "maximum": 1000
     },
+    "captureSearchScreenshots": {
+      "title": "Capture full-page screenshots for search results",
+      "type": "boolean",
+      "description": "Open up to five search-result product pages and save full-page screenshots to the run key-value store.",
+      "default": false
+    },
+    "maxSearchScreenshots": {
+      "title": "Maximum search screenshots",
+      "type": "integer",
+      "description": "Maximum number of full-page product screenshots to capture from search results. This version is capped at five.",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 5
+    },
     "onlyDiscounted": {
       "title": "Only discounted products",
       "type": "boolean",
@@ -68,7 +82,6 @@
     "sortBy": {
       "title": "Sort results by",
       "type": "string",
-      "description": "Choose how the final product results should be sorted.",
       "editor": "select",
       "enum": [
         "discount",
