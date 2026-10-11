@@ -4,6 +4,83 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
+    "mode": {
+      "title": "Mode",
+      "type": "string",
+      "description": "auto = search keywords/categories plus process direct URLs; search = only use the TikTok Shop search provider; product = only process direct URLs.",
+      "editor": "select",
+      "enum": [
+        "auto",
+        "search",
+        "product"
+      ],
+      "enumTitles": [
+        "Auto",
+        "Search products",
+        "Direct product URLs"
+      ],
+      "default": "auto"
+    },
+    "searchActorId": {
+      "title": "Search provider Actor",
+      "type": "string",
+      "description": "Actor used for TikTok Shop keyword search. Default is verified to advertise DE support.",
+      "default": "getanyapi/tiktok-shop-scraper",
+      "editor": "textfield"
+    },
+    "maxItems": {
+      "title": "Max products per search query",
+      "type": "integer",
+      "description": "Maximum number of products requested from the search provider for each keyword/category query.",
+      "default": 100,
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "onlyDiscounted": {
+      "title": "Only discounted products",
+      "type": "boolean",
+      "description": "Keep only products where a positive discount can be determined.",
+      "default": false
+    },
+    "minDiscount": {
+      "title": "Minimum discount %",
+      "type": "number",
+      "description": "Only keep products with at least this percentage discount.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 100
+    },
+    "minSold": {
+      "title": "Minimum sold count",
+      "type": "integer",
+      "description": "Only keep products with at least this source-reported sold count.",
+      "default": 0,
+      "minimum": 0
+    },
+    "minRating": {
+      "title": "Minimum rating",
+      "type": "number",
+      "description": "Only keep products with at least this rating.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 5
+    },
+    "sortBy": {
+      "title": "Sort results by",
+      "type": "string",
+      "editor": "select",
+      "enum": [
+        "discount",
+        "sold",
+        "rating"
+      ],
+      "enumTitles": [
+        "Discount",
+        "Sold count",
+        "Rating"
+      ],
+      "default": "discount"
+    },
     "productUrls": {
       "title": "Product URLs",
       "type": "array",
