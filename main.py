@@ -240,19 +240,18 @@ async def process_listing_task(
         await context.close()
 
 
-async def process_listing_task(
+async def process_product_task(
     browser: Browser,
-    req: Dict[str, Any],
+    req: Request,
     proxy_url: Optional[str],
     accept_language: str,
     region: str,
     timeouts: Dict[str, Any],
-    request_queue,
-    log,
+    capture_screenshots: bool,
     kv_store: KeyValueStore,
-    debug: bool = False,
+    log,
 ):
-    url = req.get("url")
+    url = req.url
     log.info(f"[LISTING] {url}")
     context = await create_context_for_req(browser, accept_language, proxy_url, use_mobile=True)
     page: Page = await context.new_page()
