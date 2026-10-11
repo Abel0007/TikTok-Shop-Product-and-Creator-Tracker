@@ -397,13 +397,13 @@ async def main():
             log.warning("No start URLs or keywords or categories provided.")
             return
 
-        timeouts = ms_timeouts_from_input(input_data.get("timeouts", {}))
-        accept_language = input_data.get("acceptLanguage", "en-US")
-        region = input_data.get("region", "US")
+                timeouts = ms_timeouts_from_input(input_data.get("timeouts", {}))
+        accept_language = input_data.get("acceptLanguage", "de-DE,de;q=0.9,en;q=0.8")
+        region = input_data.get("region", "DE")
         capture_screenshots = input_data.get("captureScreenshots", False)
         debug = bool(input_data.get("debug", False))
 
-                proxy_configuration = await Actor.create_proxy_configuration(
+        proxy_configuration = await Actor.create_proxy_configuration(
             actor_proxy_input=input_data.get("proxyConfiguration")
         )
 
@@ -414,12 +414,12 @@ async def main():
 
         for item in start_items:
             url = item.get("url")
-            userData = item.get("userData", {}) or {}
+            user_data = item.get("userData", {}) or {}
 
-            if not userData.get("label"):
-                userData = choose_label_for_url(url, userData)
+            if not user_data.get("label"):
+                user_data = choose_label_for_url(url, user_data)
 
-            label = userData.get("label") or PRODUCT_LABEL
+            label = user_data.get("label") or PRODUCT_LABEL
 
             request = Request.from_url(
                 url,
@@ -436,9 +436,16 @@ async def main():
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
                 headless=Actor.config.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            worker_count = int(input_data.get("maxConcurrency", input_data.get("concurrency", 3)))
+
+            worker_count = int(
+                input_data.get(
+                    "maxConcurrency",
+                    input_data.get("concurrency", 3),
+                )
+            )
+
             workers = [
                 worker_loop(
                     i,
@@ -455,6 +462,7 @@ async def main():
                 )
                 for i in range(worker_count)
             ]
+
             await asyncio.gather(*workers)
             await browser.close()
 
