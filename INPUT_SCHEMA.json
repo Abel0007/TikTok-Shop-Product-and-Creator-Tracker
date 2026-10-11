@@ -1,156 +1,32 @@
 {
-  "title": "TikTok Shop Product and Creator Tracker",
-  "description": "Track TikTok Shop products for metadata, price, availability, ratings, images, and creator-linked videos. Detect changes across runs and optionally send notifications.",
+  "title": "TikTok Shop Top Product Tracker — Data v5",
+  "description": "Search TikTok Shop products, persist snapshots across runs, calculate sales velocity, 24h/7d sales, price history, review growth, creator growth, views, commission, stock changes, trend, and a confidence-adjusted top-product score.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "mode": {
-      "title": "Mode",
-      "type": "string",
-      "description": "auto = search keywords/categories plus process direct URLs; search = only use the TikTok Shop search provider; product = only process direct URLs.",
-      "editor": "select",
-      "enum": [
-        "auto",
-        "search",
-        "product"
-      ],
-      "enumTitles": [
-        "Auto",
-        "Search products",
-        "Direct product URLs"
-      ],
-      "default": "auto"
-    },
     "searchActorId": {
       "title": "Search provider Actor",
       "type": "string",
-      "description": "Actor used for TikTok Shop keyword search. Default is verified to advertise DE support.",
+      "description": "Apify Actor used to search TikTok Shop products.",
       "default": "getanyapi/tiktok-shop-scraper",
       "editor": "textfield"
-    },
-    "maxItems": {
-      "title": "Max products per search query",
-      "type": "integer",
-      "description": "Maximum number of products requested from the search provider for each keyword/category query.",
-      "default": 100,
-      "minimum": 1,
-      "maximum": 1000
-    },
-    "enrichSearchDetails": {
-      "title": "Enrich first search results with mobile product details",
-      "type": "boolean",
-      "description": "Use a TikTok Shop mobile API Actor for the first products to enrich price, stock, seller, images and any description exposed by the source. Avoids browser CAPTCHAs.",
-      "default": true
-    },
-    "maxDetailProducts": {
-      "title": "Maximum products to enrich",
-      "type": "integer",
-      "description": "Maximum number of search results to enrich with the mobile product detail Actor. Five is recommended.",
-      "default": 5,
-      "minimum": 1,
-      "maximum": 5
-    },
-    "detailActorId": {
-      "title": "Mobile detail Actor ID",
-      "type": "string",
-      "description": "Apify Actor used to enrich product IDs without opening TikTok in a browser.",
-      "default": "cunning_soil/tiktok-shop-product-scraper-mobile-api",
-      "editor": "textfield"
-    },
-    "captureSearchScreenshots": {
-      "title": "Capture full-page screenshots for search results",
-      "type": "boolean",
-      "description": "Open up to five search-result product pages and save full-page screenshots to the run key-value store.",
-      "default": false
-    },
-    "maxSearchScreenshots": {
-      "title": "Maximum search screenshots",
-      "type": "integer",
-      "description": "Maximum number of full-page product screenshots to capture from search results. This version is capped at five.",
-      "default": 5,
-      "minimum": 1,
-      "maximum": 5
-    },
-    "onlyDiscounted": {
-      "title": "Only discounted products",
-      "type": "boolean",
-      "description": "Keep only products where a positive discount can be determined.",
-      "default": false
-    },
-    "minDiscount": {
-      "title": "Minimum discount %",
-      "type": "number",
-      "description": "Only keep products with at least this percentage discount.",
-      "default": 0,
-      "minimum": 0,
-      "maximum": 100
-    },
-    "minSold": {
-      "title": "Minimum sold count",
-      "type": "integer",
-      "description": "Only keep products with at least this source-reported sold count.",
-      "default": 0,
-      "minimum": 0
-    },
-    "minRating": {
-      "title": "Minimum rating",
-      "type": "number",
-      "description": "Only keep products with at least this rating.",
-      "default": 0,
-      "minimum": 0,
-      "maximum": 5
-    },
-    "sortBy": {
-      "title": "Sort results by",
-      "type": "string",
-      "editor": "select",
-      "enum": [
-        "discount",
-        "sold",
-        "rating"
-      ],
-      "enumTitles": [
-        "Discount",
-        "Sold count",
-        "Rating"
-      ],
-      "default": "discount",
-      "description": "Choose how the final product results should be sorted."
-    },
-    "productUrls": {
-      "title": "Product URLs",
-      "type": "array",
-      "description": "List of TikTok Shop product detail URLs to scrape.",
-      "editor": "stringList",
-      "items": {
-        "type": "string"
-      },
-      "default": []
-    },
-    "sellerHandles": {
-      "title": "Seller handles",
-      "type": "array",
-      "description": "TikTok Shop seller handles or shop usernames. The actor will discover products from these sellers.",
-      "editor": "stringList",
-      "items": {
-        "type": "string"
-      },
-      "default": []
     },
     "keywords": {
       "title": "Keywords",
       "type": "array",
-      "description": "Search keywords to find products in TikTok Shop.",
+      "description": "One or more TikTok Shop search terms, for example Beauty, Airfryer, Saugroboter, or Kosmetik.",
       "editor": "stringList",
       "items": {
         "type": "string"
       },
-      "default": []
+      "default": [
+        "Beauty"
+      ]
     },
     "tiktokCategories": {
-      "title": "TikTok Categories",
+      "title": "TikTok categories",
       "type": "array",
-      "description": "Select one or more TikTok Shop categories (optional).",
+      "description": "Optional broad categories that are converted into search queries.",
       "editor": "select",
       "items": {
         "type": "string",
@@ -179,20 +55,10 @@
       },
       "default": []
     },
-    "categoryUrls": {
-      "title": "Category URLs",
-      "type": "array",
-      "description": "Paste TikTok Shop category URLs manually (optional).",
-      "editor": "stringList",
-      "items": {
-        "type": "string"
-      },
-      "default": []
-    },
     "region": {
       "title": "Region",
       "type": "string",
-      "description": "Preferred TikTok Shop market locale. Used for Accept-Language and regional hints.",
+      "description": "TikTok Shop market passed to the search provider.",
       "editor": "select",
       "enum": [
         "US",
@@ -218,149 +84,183 @@
       ],
       "default": "DE"
     },
-    "acceptLanguage": {
-      "title": "Accept-Language header",
-      "type": "string",
-      "description": "Value used for the browser Accept-Language header.",
-      "editor": "textfield",
-      "default": "de-DE,de;q=0.9,en;q=0.8"
-    },
-    "limits": {
-      "title": "Limits",
-      "type": "object",
-      "description": "Optional limits for discovery and scraping.",
-      "editor": "json",
-      "properties": {
-        "maxProducts": {
-          "title": "Max products total",
-          "type": "integer",
-          "description": "Stop after collecting this many products overall. Leave empty for unlimited.",
-          "minimum": 1
-        },
-        "maxProductsPerSeller": {
-          "title": "Max products per seller",
-          "type": "integer",
-          "description": "Limit products discovered per seller.",
-          "minimum": 1
-        },
-        "maxProductsPerCategory": {
-          "title": "Max products per category",
-          "type": "integer",
-          "description": "Limit products discovered per category URL.",
-          "minimum": 1
-        }
-      },
-      "default": {}
-    },
-    "maxConcurrency": {
-      "title": "Max concurrency",
+    "maxItems": {
+      "title": "Max products per query",
       "type": "integer",
-      "description": "Maximum number of concurrent product page tasks.",
-      "default": 5,
+      "description": "Maximum products requested from the search provider for each keyword/category.",
+      "default": 100,
       "minimum": 1,
-      "maximum": 50
+      "maximum": 1000
     },
-    "timeouts": {
-      "title": "Timeouts",
-      "type": "object",
-      "description": "Navigation and request timeouts in seconds.",
-      "editor": "json",
-      "properties": {
-        "navigationTimeoutSecs": {
-          "title": "Navigation timeout (secs)",
-          "type": "integer",
-          "description": "Maximum time in seconds to wait for a page navigation before failing.",
-          "minimum": 5,
-          "maximum": 120
-        },
-        "requestTimeoutSecs": {
-          "title": "Request timeout (secs)",
-          "type": "integer",
-          "description": "Maximum time in seconds to wait for network requests before failing.",
-          "minimum": 5,
-          "maximum": 120
-        }
-      },
-      "default": {
-        "navigationTimeoutSecs": 25,
-        "requestTimeoutSecs": 30
-      }
+    "maxOutputProducts": {
+      "title": "Max products in output",
+      "type": "integer",
+      "description": "Maximum ranked products written to the final Dataset. All discovered products can still be tracked in history before this output limit is applied.",
+      "default": 100,
+      "minimum": 1,
+      "maximum": 1000
     },
-    "includeCreatorVideos": {
-      "title": "Include creator-linked videos",
+    "trackHistory": {
+      "title": "Track history",
       "type": "boolean",
-      "description": "Attempt to collect creator-linked videos and basic engagement stats.",
+      "description": "Persist product snapshots between runs so sold24h, sold7d, price history, trend, creator growth, review growth, views growth, and stock changes can be calculated.",
       "default": true
     },
-    "captureScreenshots": {
-      "title": "Capture screenshots",
-      "type": "boolean",
-      "description": "Capture a full-page product screenshot and save to the default key-value store.",
-      "default": false
-    },
-    "notify": {
-      "title": "Notifications",
-      "type": "object",
-      "description": "Optional Slack or generic webhook notifications on price or availability changes.",
-      "editor": "json",
-      "properties": {
-        "enabled": {
-          "title": "Enable notifications",
-          "type": "boolean",
-          "description": "Turn notifications on or off."
-        },
-        "onlyOnChange": {
-          "title": "Only on change",
-          "type": "boolean",
-          "description": "Send notifications only when price or availability changes. If false, send a summary for each run."
-        },
-        "slackWebhookUrl": {
-          "title": "Slack webhook URL",
-          "type": "string",
-          "description": "Slack incoming webhook URL for alerts."
-        },
-        "webhookUrl": {
-          "title": "Generic webhook URL",
-          "type": "string",
-          "description": "Custom webhook URL to receive JSON payloads with detected changes."
-        }
-      },
-      "default": {
-        "enabled": true,
-        "onlyOnChange": true
-      }
-    },
-    "proxyConfiguration": {
-      "title": "Proxy configuration",
-      "type": "object",
-      "description": "Use Apify Proxy or custom proxies. Regional proxies are recommended to match the selected region.",
-      "editor": "proxy"
-    },
-    "debug": {
-      "title": "Debug mode",
-      "type": "boolean",
-      "description": "Enable verbose logging and keep more data in the default key-value store.",
-      "default": false
-    },
-    "deepCreatorVideos": {
-      "title": "Deep creator videos",
-      "type": "boolean",
-      "description": "When creator videos are enabled, ask the fallback detail scraper to collect beyond the first 30 videos. This can increase cost.",
-      "default": false
-    },
-    "fallbackEnabled": {
-      "title": "Use external fallback when TikTok blocks",
-      "type": "boolean",
-      "description": "If direct Playwright access hits TikTok Security Check, call the configured TikTok Shop detail Actor automatically.",
-      "default": true
-    },
-    "fallbackActorId": {
-      "title": "Fallback Actor ID",
+    "historyStoreName": {
+      "title": "History Key-value store",
       "type": "string",
-      "description": "Apify Actor to call after a TikTok Security Check. Expected input: items, country, maxItems, includeCreatorVideos, deepCreatorVideos.",
-      "default": "jungle_synthesizer/tiktok-shop-product-detail-scraper",
+      "description": "Named persistent Key-value store used for product history across Actor runs.",
+      "default": "tiktok-shop-top-products-history",
       "editor": "textfield"
+    },
+    "maxSnapshotsPerProduct": {
+      "title": "Max snapshots per product",
+      "type": "integer",
+      "description": "Maximum historical snapshots retained for each product.",
+      "default": 500,
+      "minimum": 10,
+      "maximum": 5000
+    },
+    "windowToleranceHours": {
+      "title": "Historical baseline tolerance (hours)",
+      "type": "number",
+      "description": "Maximum time difference allowed when selecting the nearest historical snapshot for 24h, 7d, and 14d metrics. 18 hours works well for roughly daily runs.",
+      "default": 18,
+      "minimum": 1,
+      "maximum": 72
+    },
+    "priceMode": {
+      "title": "Price normalization",
+      "type": "string",
+      "description": "auto keeps small integer prices as major currency units and divides large integer-like values by priceDivisor; raw never divides; minor_units always divides.",
+      "editor": "select",
+      "enum": [
+        "auto",
+        "raw",
+        "minor_units"
+      ],
+      "enumTitles": [
+        "Auto (recommended)",
+        "Raw provider value",
+        "Always minor units / divisor"
+      ],
+      "default": "auto"
+    },
+    "priceDivisor": {
+      "title": "Price divisor",
+      "type": "number",
+      "description": "Divisor used for minor-unit prices. Use 100 for cents.",
+      "default": 100,
+      "exclusiveMinimum": 0
+    },
+    "autoMinorUnitThreshold": {
+      "title": "Auto minor-unit threshold",
+      "type": "number",
+      "description": "In auto price mode, integer-like raw prices at or above this value are divided by priceDivisor. Default 100 handles values such as 861 -> 8.61 while keeping 19 -> 19.00.",
+      "default": 100,
+      "minimum": 1
+    },
+    "onlyDiscounted": {
+      "title": "Only discounted",
+      "type": "boolean",
+      "description": "Keep only products with a positive discountPercent.",
+      "default": false
+    },
+    "onlyInStock": {
+      "title": "Only in stock",
+      "type": "boolean",
+      "description": "Keep only products whose provider explicitly exposes inStock=true or a positive stock quantity.",
+      "default": false
+    },
+    "minDiscount": {
+      "title": "Minimum discount %",
+      "type": "number",
+      "description": "Minimum discountPercent required in final output.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 100
+    },
+    "minSoldTotal": {
+      "title": "Minimum total sold",
+      "type": "integer",
+      "description": "Minimum provider-reported cumulative soldCount.",
+      "default": 0,
+      "minimum": 0
+    },
+    "minSold24h": {
+      "title": "Minimum sold in 24h",
+      "type": "integer",
+      "description": "Minimum sold24h required. Leave at 0 until enough history has been collected.",
+      "default": 0,
+      "minimum": 0
+    },
+    "minSold7d": {
+      "title": "Minimum sold in 7d",
+      "type": "integer",
+      "description": "Minimum sold7d required. Leave at 0 until at least about 7 days of snapshots exist.",
+      "default": 0,
+      "minimum": 0
+    },
+    "minRating": {
+      "title": "Minimum rating",
+      "type": "number",
+      "description": "Minimum product rating required.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 5
+    },
+    "minCommissionPercent": {
+      "title": "Minimum commission %",
+      "type": "number",
+      "description": "Minimum affiliate commission required when commissionPercent is provided by the source.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 100
+    },
+    "sortBy": {
+      "title": "Sort results by",
+      "type": "string",
+      "description": "Metric used to rank the final output.",
+      "editor": "select",
+      "enum": [
+        "top_score",
+        "sold24h",
+        "sold7d",
+        "sales_growth",
+        "creator_growth",
+        "views7d",
+        "review_growth",
+        "commission",
+        "rating",
+        "discount",
+        "sold_total",
+        "price"
+      ],
+      "enumTitles": [
+        "Top product score",
+        "Sold 24h",
+        "Sold 7d",
+        "Sales growth 7d",
+        "Creator growth 7d",
+        "Views growth 7d",
+        "Review growth 7d",
+        "Commission %",
+        "Rating",
+        "Discount %",
+        "Total sold",
+        "Current price"
+      ],
+      "default": "top_score"
+    },
+    "includeRawProviderData": {
+      "title": "Include raw provider data",
+      "type": "boolean",
+      "description": "Include the complete original search-provider record in each Dataset row for debugging and discovery of additional fields.",
+      "default": false
     }
   },
-  "required": []
+  "required": [
+    "keywords",
+    "region"
+  ]
 }
