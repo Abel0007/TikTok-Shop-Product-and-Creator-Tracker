@@ -520,6 +520,11 @@ def normalize_search_product(
         "region": region.upper(),
         "productId": str(raw.get("productId")) if raw.get("productId") is not None else None,
         "title": raw.get("title"),
+        "description": (
+            raw.get("description")
+            or raw.get("productDescription")
+            or raw.get("product_description")
+        ),
         "price": price,
         "originalPrice": original_price,
         "discountPercent": discount_percent,
@@ -1325,6 +1330,231 @@ async def worker_loop(
     log.info(f"Worker {worker_id} finished")
 
 
+
+# ---------------------
+# Search result screenshot enrichment
+# ---------------------
+
+async def enrich_search_products_with_screenshots(
+    products: List[Dict[str, Any]],
+    max_screenshots: int,
+    proxy_configuration,
+    accept_language: str,
+    timeouts: Dict[str, Any],
+    kv_store: KeyValueStore,
+    log,
+    debug: bool = False,
+) -> None:
+    """
+    Open up to max_screenshots product URLs from search results, capture a
+    full-page screenshot, and enrich the result with page metadata.
+
+    Best-effort only: if TikTok returns a Security Check, the screenshot is
+    still stored and the result is marked SECURITY_CHECK.
+    """
+    if max_screenshots <= 0:
+        return
+
+    candidates = [
+        product
+        for product in products
+        if product.get("productUrl")
+    ][:max_screenshots]
+
+    if not candidates:
+        log.info("[SCREENSHOT] No product URLs available.")
+        return
+
+    log.info(
+        f"[SCREENSHOT] Capturing {len(candidates)} full-page product screenshots."
+    )
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        try:
+            for index, product in enumerate(candidates, start=1):
+                url = str(product.get("productUrl") or "").strip()
+                if not url:
+                    continue
+
+                proxy_url: Optional[str] = None
+
+                if proxy_configuration is not None:
+                    try:
+                        proxy_url = await proxy_configuration.new_url()
+                    except Exception as exc:
+                        log.warning(
+                            f"[SCREENSHOT] Proxy URL failed for {url}: {exc}"
+                        )
+
+                context: Optional[BrowserContext] = None
+                page: Optional[Page] = None
+                response: Optional[Response] = None
+
+                try:
+                    context = await create_context_for_req(
+                        browser=browser,
+                        accept_language=accept_language,
+                        proxy_url=proxy_url,
+                        use_mobile=True,
+                    )
+                    page = await context.new_page()
+
+                    log.info(
+                        f"[SCREENSHOT] ({index}/{len(candidates)}) {url}"
+                    )
+
+                    response = await page.goto(
+                        url,
+                        timeout=timeouts.get(
+                            "navigation",
+                            DEFAULT_NAVIGATION_TIMEOUT_MS,
+                        ),
+                        wait_until="domcontentloaded",
+                    )
+
+                    await page.wait_for_timeout(2_000)
+
+                    try:
+                        page_title = await page.title()
+                    except Exception:
+                        page_title = None
+
+                    normalized_title = (page_title or "").strip().lower()
+                    challenge_markers = (
+                        "security check",
+                        "verify to continue",
+                        "verification",
+                        "captcha",
+                    )
+
+                    blocked = any(
+                        marker in normalized_title
+                        for marker in challenge_markers
+                    )
+
+                    page_description = (
+                        await get_meta_content(
+                            page,
+                            'meta[property="og:description"]',
+                        )
+                        or await get_meta_content(
+                            page,
+                            'meta[name="description"]',
+                        )
+                    )
+
+                    try:
+                        raw_json_ld = await page.locator(
+                            'script[type="application/ld+json"]'
+                        ).all_text_contents()
+                    except Exception:
+                        raw_json_ld = []
+
+                    structured = parse_json_ld_product(raw_json_ld)
+
+                    if not product.get("description"):
+                        product["description"] = (
+                            structured.get("description")
+                            or page_description
+                        )
+
+                    screenshot_key = stable_key(
+                        "search-product",
+                        str(product.get("productId") or url),
+                        "png",
+                    )
+
+                    screenshot = await page.screenshot(
+                        full_page=True
+                    )
+
+                    await kv_store.set_value(
+                        screenshot_key,
+                        screenshot,
+                        content_type="image/png",
+                    )
+
+                    product["screenshotKey"] = screenshot_key
+                    product["screenshotStatus"] = (
+                        "SECURITY_CHECK"
+                        if blocked
+                        else "PRODUCT_PAGE"
+                    )
+                    product["screenshotHttpStatus"] = (
+                        response.status
+                        if response is not None
+                        else None
+                    )
+                    product["screenshotFinalUrl"] = page.url
+                    product["pageTitle"] = page_title
+
+                    if blocked:
+                        product["descriptionStatus"] = (
+                            "UNAVAILABLE_SECURITY_CHECK"
+                        )
+                    elif product.get("description"):
+                        product["descriptionStatus"] = "AVAILABLE"
+                    else:
+                        product["descriptionStatus"] = "NOT_FOUND"
+
+                    log.info(
+                        f"[SCREENSHOT] Saved kv://{screenshot_key} "
+                        f"status={product['screenshotStatus']}"
+                    )
+
+                    if debug:
+                        try:
+                            html_key = stable_key(
+                                "search-product-debug",
+                                str(product.get("productId") or url),
+                                "html",
+                            )
+                            await kv_store.set_value(
+                                html_key,
+                                await page.content(),
+                                content_type="text/html",
+                            )
+                            product["debugHtmlKey"] = html_key
+                        except Exception as exc:
+                            log.warning(
+                                f"[SCREENSHOT] Debug HTML failed for {url}: {exc}"
+                            )
+
+                except Exception as exc:
+                    product["screenshotStatus"] = "ERROR"
+                    product["screenshotError"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    log.warning(
+                        f"[SCREENSHOT] Failed for {url}: "
+                        f"{product['screenshotError']}"
+                    )
+
+                finally:
+                    if page is not None:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+
+                    if context is not None:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+
+        finally:
+            await browser.close()
+
+
 # ---------------------
 # Main
 # ---------------------
@@ -1504,6 +1734,64 @@ async def main() -> None:
                 sort_by=sort_by,
             )
 
+            capture_search_screenshots = bool(
+                input_data.get(
+                    "captureSearchScreenshots",
+                    False,
+                )
+            )
+
+            max_search_screenshots = max(
+                0,
+                min(
+                    5,
+                    int(
+                        input_data.get(
+                            "maxSearchScreenshots",
+                            5,
+                        )
+                    ),
+                ),
+            )
+
+            if capture_search_screenshots and filtered_products:
+                accept_language_for_search = input_data.get(
+                    "acceptLanguage",
+                    "de-DE,de;q=0.9,en;q=0.8",
+                )
+
+                screenshot_timeouts = ms_timeouts_from_input(
+                    input_data.get("timeouts", {})
+                )
+
+                screenshot_debug = bool(
+                    input_data.get(
+                        "debug",
+                        False,
+                    )
+                )
+
+                screenshot_proxy_configuration = (
+                    await Actor.create_proxy_configuration(
+                        actor_proxy_input=input_data.get(
+                            "proxyConfiguration"
+                        )
+                    )
+                )
+
+                screenshot_kv_store = await KeyValueStore.open()
+
+                await enrich_search_products_with_screenshots(
+                    products=filtered_products,
+                    max_screenshots=max_search_screenshots,
+                    proxy_configuration=screenshot_proxy_configuration,
+                    accept_language=accept_language_for_search,
+                    timeouts=screenshot_timeouts,
+                    kv_store=screenshot_kv_store,
+                    log=log,
+                    debug=screenshot_debug,
+                )
+
             if filtered_products:
                 await Actor.push_data(
                     filtered_products
@@ -1519,6 +1807,16 @@ async def main() -> None:
                     "productsReceived": len(search_products),
                     "uniqueProducts": len(deduped),
                     "productsSaved": len(filtered_products),
+                    "captureSearchScreenshots": capture_search_screenshots,
+                    "maxSearchScreenshots": max_search_screenshots,
+                    "screenshotsAttempted": (
+                        min(
+                            max_search_screenshots,
+                            len(filtered_products),
+                        )
+                        if capture_search_screenshots
+                        else 0
+                    ),
                     "filters": {
                         "onlyDiscounted": only_discounted,
                         "minDiscount": min_discount,
