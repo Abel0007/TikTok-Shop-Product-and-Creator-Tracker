@@ -9,7 +9,9 @@
       "type": "array",
       "description": "List of TikTok Shop product detail URLs to scrape.",
       "editor": "stringList",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "default": []
     },
     "sellerHandles": {
@@ -17,7 +19,9 @@
       "type": "array",
       "description": "TikTok Shop seller handles or shop usernames. The actor will discover products from these sellers.",
       "editor": "stringList",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "default": []
     },
     "keywords": {
@@ -25,10 +29,11 @@
       "type": "array",
       "description": "Search keywords to find products in TikTok Shop.",
       "editor": "stringList",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "default": []
     },
-
     "tiktokCategories": {
       "title": "TikTok Categories",
       "type": "array",
@@ -61,43 +66,52 @@
       },
       "default": []
     },
-
     "categoryUrls": {
       "title": "Category URLs",
       "type": "array",
       "description": "Paste TikTok Shop category URLs manually (optional).",
       "editor": "stringList",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "default": []
     },
-
-  "region": {
-  "title": "Region",
-  "type": "string",
-  "description": "Preferred TikTok Shop market locale. Used for Accept-Language and regional hints.",
-  "editor": "select",
-  "enum": ["US", "GB", "DE", "SG", "MY", "TH", "VN", "PH", "ID"],
-  "enumTitles": [
-    "United States",
-    "United Kingdom",
-    "Germany",
-    "Singapore",
-    "Malaysia",
-    "Thailand",
-    "Vietnam",
-    "Philippines",
-    "Indonesia"
-  ],
-  "default": "DE"
-},
-"acceptLanguage": {
-  "title": "Accept-Language header",
-  "type": "string",
-  "description": "Value used for the browser Accept-Language header.",
-  "editor": "textfield",
-  "default": "de-DE,de;q=0.9,en;q=0.8"
-},
-
+    "region": {
+      "title": "Region",
+      "type": "string",
+      "description": "Preferred TikTok Shop market locale. Used for Accept-Language and regional hints.",
+      "editor": "select",
+      "enum": [
+        "US",
+        "GB",
+        "DE",
+        "SG",
+        "MY",
+        "TH",
+        "VN",
+        "PH",
+        "ID"
+      ],
+      "enumTitles": [
+        "United States",
+        "United Kingdom",
+        "Germany",
+        "Singapore",
+        "Malaysia",
+        "Thailand",
+        "Vietnam",
+        "Philippines",
+        "Indonesia"
+      ],
+      "default": "DE"
+    },
+    "acceptLanguage": {
+      "title": "Accept-Language header",
+      "type": "string",
+      "description": "Value used for the browser Accept-Language header.",
+      "editor": "textfield",
+      "default": "de-DE,de;q=0.9,en;q=0.8"
+    },
     "limits": {
       "title": "Limits",
       "type": "object",
@@ -125,7 +139,6 @@
       },
       "default": {}
     },
-
     "maxConcurrency": {
       "title": "Max concurrency",
       "type": "integer",
@@ -134,7 +147,6 @@
       "minimum": 1,
       "maximum": 50
     },
-
     "timeouts": {
       "title": "Timeouts",
       "type": "object",
@@ -161,21 +173,18 @@
         "requestTimeoutSecs": 30
       }
     },
-
     "includeCreatorVideos": {
       "title": "Include creator-linked videos",
       "type": "boolean",
       "description": "Attempt to collect creator-linked videos and basic engagement stats.",
       "default": true
     },
-
     "captureScreenshots": {
       "title": "Capture screenshots",
       "type": "boolean",
       "description": "Capture a full-page product screenshot and save to the default key-value store.",
       "default": false
     },
-
     "notify": {
       "title": "Notifications",
       "type": "object",
@@ -208,19 +217,36 @@
         "onlyOnChange": true
       }
     },
-
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
       "description": "Use Apify Proxy or custom proxies. Regional proxies are recommended to match the selected region.",
       "editor": "proxy"
     },
-
     "debug": {
       "title": "Debug mode",
       "type": "boolean",
       "description": "Enable verbose logging and keep more data in the default key-value store.",
       "default": false
+    },
+    "deepCreatorVideos": {
+      "title": "Deep creator videos",
+      "type": "boolean",
+      "description": "When creator videos are enabled, ask the fallback detail scraper to collect beyond the first 30 videos. This can increase cost.",
+      "default": false
+    },
+    "fallbackEnabled": {
+      "title": "Use external fallback when TikTok blocks",
+      "type": "boolean",
+      "description": "If direct Playwright access hits TikTok Security Check, call the configured TikTok Shop detail Actor automatically.",
+      "default": true
+    },
+    "fallbackActorId": {
+      "title": "Fallback Actor ID",
+      "type": "string",
+      "description": "Apify Actor to call after a TikTok Security Check. Expected input: items, country, maxItems, includeCreatorVideos, deepCreatorVideos.",
+      "default": "jungle_synthesizer/tiktok-shop-product-detail-scraper",
+      "editor": "textfield"
     }
   },
   "required": []
