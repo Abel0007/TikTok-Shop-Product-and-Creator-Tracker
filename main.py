@@ -494,60 +494,78 @@ async def process_product_task(
         final_url = page.url
         status = response.status if response else None
 
-    try:
+        try:
             page_title = await page.title()
         except Exception:
             page_title = None
 
-        # Detect TikTok anti-bot / security challenge
-        challenge_titles = {
+        # Detect TikTok anti-bot / security challenge.
+        challenge_markers = (
             "security check",
             "verify to continue",
             "verification",
             "captcha",
-        }
-
+        )
         normalized_title = (page_title or "").strip().lower()
 
-        if normalized_title in challenge_titles:
+        if any(marker in normalized_title for marker in challenge_markers):
             log.warning(
                 f"[PRODUCT] TikTok security challenge detected: {url}"
             )
 
-            await Actor.push_data({
+            blocked_record = {
                 "type": "blocked",
                 "sourceUrl": url,
                 "finalUrl": page.url,
-                "productId": extract_product_id(url),
+                "productId": extract_product_id(page.url)
+                or extract_product_id(url),
                 "region": region,
                 "httpStatus": status,
                 "reason": "TIKTOK_SECURITY_CHECK",
                 "title": page_title,
-            })
+            }
+
+            await Actor.push_data(blocked_record)
 
             if debug:
-                key = stable_key(
-                    "security-check",
-                    url,
-                    "html",
-                )
-                await kv_store.set_value(
-                    key,
-                    await page.content(),
-                    content_type="text/html",
-                )
+                try:
+                    key = stable_key(
+                        "security-check",
+                        url,
+                        "html",
+                    )
+                    await kv_store.set_value(
+                        key,
+                        await page.content(),
+                        content_type="text/html",
+                    )
+                    log.info(
+                        f"[PRODUCT] security-check HTML saved to kv://{key}"
+                    )
+                except Exception as exc:
+                    log.warning(
+                        f"[PRODUCT] Could not save security-check HTML: {exc}"
+                    )
 
             if capture_screenshots:
-                key = stable_key(
-                    "security-check",
-                    url,
-                    "png",
-                )
-                await kv_store.set_value(
-                    key,
-                    await page.screenshot(full_page=True),
-                    content_type="image/png",
-                )
+                try:
+                    key = stable_key(
+                        "security-check",
+                        url,
+                        "png",
+                    )
+                    await kv_store.set_value(
+                        key,
+                        await page.screenshot(full_page=True),
+                        content_type="image/png",
+                    )
+                    log.info(
+                        f"[PRODUCT] security-check screenshot saved to kv://{key}"
+                    )
+                except Exception as exc:
+                    log.warning(
+                        f"[PRODUCT] Could not save security-check screenshot: {exc}"
+                    )
 
             return
 
