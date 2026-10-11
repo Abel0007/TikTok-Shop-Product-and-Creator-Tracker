@@ -71,24 +71,25 @@
       "default": []
     },
 
-    "region": {
-      "title": "Region",
-      "type": "string",
-      "description": "Preferred TikTok Shop market locale. Used for Accept-Language and regional hints.",
-      "editor": "select",
-      "enum": ["US", "GB", "SG", "MY", "TH", "VN", "PH", "ID"],
-      "enumTitles": [
-        "United States",
-        "United Kingdom",
-        "Singapore",
-        "Malaysia",
-        "Thailand",
-        "Vietnam",
-        "Philippines",
-        "Indonesia"
-      ],
-      "default": "US"
-    },
+  "region": {
+  "title": "Region",
+  "type": "string",
+  "description": "Preferred TikTok Shop market locale. Used for Accept-Language and regional hints.",
+  "editor": "select",
+  "enum": ["US", "GB", "DE", "SG", "MY", "TH", "VN", "PH", "ID"],
+  "enumTitles": [
+    "United States",
+    "United Kingdom",
+    "Germany",
+    "Singapore",
+    "Malaysia",
+    "Thailand",
+    "Vietnam",
+    "Philippines",
+    "Indonesia"
+  ],
+  "default": "DE"
+}
 
     "acceptLanguage": {
       "title": "Accept-Language header",
