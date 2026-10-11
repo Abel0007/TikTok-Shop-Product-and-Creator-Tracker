@@ -89,15 +89,14 @@
     "Indonesia"
   ],
   "default": "DE"
-}
-
-    "acceptLanguage": {
-      "title": "Accept-Language header",
-      "type": "string",
-      "description": "Custom Accept-Language header to hint region and language in the browser context.",
-      "editor": "textfield",
-      "default": "de-DE,de;q=0.9,en;q=0.8"
-    },
+},
+"acceptLanguage": {
+  "title": "Accept-Language header",
+  "type": "string",
+  "description": "Value used for the browser Accept-Language header.",
+  "editor": "textfield",
+  "default": "de-DE,de;q=0.9,en;q=0.8"
+},
 
     "limits": {
       "title": "Limits",
