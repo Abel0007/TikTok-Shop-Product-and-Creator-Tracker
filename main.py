@@ -42,6 +42,8 @@ PRODUCT_URL_MARKERS = (
     "/item/",
 )
 
+DEFAULT_FALLBACK_ACTOR_ID = "jungle_synthesizer/tiktok-shop-product-detail-scraper"
+
 
 # ---------------------
 # Helpers
@@ -448,6 +450,130 @@ async def auto_scroll_page(
         )
 
 
+
+# ---------------------
+# External product fallback
+# ---------------------
+
+def normalize_fallback_product(
+    raw: Dict[str, Any],
+    source_url: str,
+    fallback_actor_id: str,
+) -> Dict[str, Any]:
+    """
+    Normalize the documented output of the fallback TikTok Shop product Actor
+    to the stable camelCase schema used by this Actor.
+    """
+    return {
+        "type": "product",
+        "source": fallback_actor_id,
+        "fallbackUsed": True,
+        "sourceUrl": source_url,
+        "productId": raw.get("product_id"),
+        "title": raw.get("product_name"),
+        "description": raw.get("description"),
+        "brand": raw.get("brand"),
+        "categoryPath": raw.get("category_path"),
+        "price": raw.get("price"),
+        "originalPrice": raw.get("original_price"),
+        "currency": raw.get("currency"),
+        "discountPercent": raw.get("discount_percent"),
+        "soldCount": raw.get("sold_count"),
+        "availableQuantity": raw.get("available_quantity"),
+        "inStock": raw.get("in_stock"),
+        "rating": raw.get("rating"),
+        "reviewCount": raw.get("review_count"),
+        "images": raw.get("images") or [],
+        "videos": raw.get("videos") or [],
+        "variants": raw.get("variants") or [],
+        "shopName": raw.get("shop_name"),
+        "shopId": raw.get("shop_id"),
+        "productUrl": raw.get("product_url"),
+        "region": raw.get("region"),
+        "creatorVideos": raw.get("creator_videos") or [],
+        "creatorVideosCount": raw.get("creator_videos_count"),
+        "scrapedAt": raw.get("scrapedAt"),
+    }
+
+
+async def call_product_fallback(
+    source_url: str,
+    region: str,
+    include_creator_videos: bool,
+    deep_creator_videos: bool,
+    fallback_actor_id: str,
+    log,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Call a second Apify Actor only when direct Playwright access is blocked.
+
+    Returns:
+        (normalized_product, None) on success
+        (None, error_message) on failure
+    """
+    item = extract_product_id(source_url) or source_url
+    country = (region or "DE").strip().lower()
+
+    fallback_input = {
+        "items": [item],
+        "country": country,
+        "maxItems": 1,
+        "includeCreatorVideos": bool(include_creator_videos),
+        "deepCreatorVideos": bool(deep_creator_videos),
+    }
+
+    try:
+        log.info(
+            f"[FALLBACK] Calling {fallback_actor_id} "
+            f"for item={item}, country={country}"
+        )
+
+        run = await Actor.call(
+            fallback_actor_id,
+            run_input=fallback_input,
+            max_items=1,
+        )
+
+        if run is None or not run.default_dataset_id:
+            return None, "Fallback Actor finished without a dataset."
+
+        page = await Actor.apify_client.dataset(
+            run.default_dataset_id
+        ).list_items(limit=1)
+
+        items = page.items or []
+
+        if not items:
+            return None, "Fallback Actor returned no product records."
+
+        raw = items[0]
+
+        if not isinstance(raw, dict):
+            return None, "Fallback Actor returned an unexpected result type."
+
+        product = normalize_fallback_product(
+            raw=raw,
+            source_url=source_url,
+            fallback_actor_id=fallback_actor_id,
+        )
+
+        if not product.get("productId") and not product.get("title"):
+            return None, "Fallback Actor returned an incomplete product record."
+
+        log.info(
+            f"[FALLBACK] Success: "
+            f"productId={product.get('productId')}, "
+            f"title={product.get('title')!r}"
+        )
+
+        return product, None
+
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        log.warning(f"[FALLBACK] Failed: {message}")
+        return None, message
+
+
 # ---------------------
 # Product task
 # ---------------------
@@ -463,6 +589,10 @@ async def process_product_task(
     kv_store: KeyValueStore,
     log,
     debug: bool = False,
+    fallback_enabled: bool = True,
+    fallback_actor_id: str = DEFAULT_FALLBACK_ACTOR_ID,
+    include_creator_videos: bool = False,
+    deep_creator_videos: bool = False,
 ) -> None:
     url = req.url
     log.info(f"[PRODUCT] {url}")
@@ -513,20 +643,7 @@ async def process_product_task(
                 f"[PRODUCT] TikTok security challenge detected: {url}"
             )
 
-            blocked_record = {
-                "type": "blocked",
-                "sourceUrl": url,
-                "finalUrl": page.url,
-                "productId": extract_product_id(page.url)
-                or extract_product_id(url),
-                "region": region,
-                "httpStatus": status,
-                "reason": "TIKTOK_SECURITY_CHECK",
-                "title": page_title,
-            }
-
-            await Actor.push_data(blocked_record)
-
+            # Keep diagnostics from our own scraper.
             if debug:
                 try:
                     key = stable_key(
@@ -567,6 +684,44 @@ async def process_product_task(
                         f"[PRODUCT] Could not save security-check screenshot: {exc}"
                     )
 
+            # Fallback to a dedicated TikTok Shop detail Actor.
+            if fallback_enabled:
+                product, fallback_error = await call_product_fallback(
+                    source_url=url,
+                    region=region,
+                    include_creator_videos=include_creator_videos,
+                    deep_creator_videos=deep_creator_videos,
+                    fallback_actor_id=fallback_actor_id,
+                    log=log,
+                )
+
+                if product is not None:
+                    await Actor.push_data(product)
+                    return
+            else:
+                fallback_error = "Fallback disabled by input."
+
+            # If fallback also fails, return a clean blocked record.
+            await Actor.push_data(
+                {
+                    "type": "blocked",
+                    "sourceUrl": url,
+                    "finalUrl": page.url,
+                    "productId": extract_product_id(page.url)
+                    or extract_product_id(url),
+                    "region": region,
+                    "httpStatus": status,
+                    "reason": "TIKTOK_SECURITY_CHECK",
+                    "title": page_title,
+                    "fallbackUsed": bool(fallback_enabled),
+                    "fallbackActor": (
+                        fallback_actor_id
+                        if fallback_enabled
+                        else None
+                    ),
+                    "fallbackError": fallback_error,
+                }
+            )
             return
 
         og_title = await get_meta_content(
@@ -905,6 +1060,10 @@ async def worker_loop(
     kv_store: KeyValueStore,
     log,
     debug: bool,
+    fallback_enabled: bool,
+    fallback_actor_id: str,
+    include_creator_videos: bool,
+    deep_creator_videos: bool,
 ) -> None:
     log.info(f"Worker {worker_id} started")
 
@@ -946,6 +1105,10 @@ async def worker_loop(
                     kv_store,
                     log,
                     debug,
+                    fallback_enabled,
+                    fallback_actor_id,
+                    include_creator_videos,
+                    deep_creator_videos,
                 )
             else:
                 await process_listing_task(
@@ -1142,6 +1305,34 @@ async def main() -> None:
             )
         )
 
+        fallback_enabled = bool(
+            input_data.get(
+                "fallbackEnabled",
+                True,
+            )
+        )
+
+        fallback_actor_id = str(
+            input_data.get(
+                "fallbackActorId",
+                DEFAULT_FALLBACK_ACTOR_ID,
+            )
+        ).strip() or DEFAULT_FALLBACK_ACTOR_ID
+
+        include_creator_videos = bool(
+            input_data.get(
+                "includeCreatorVideos",
+                False,
+            )
+        )
+
+        deep_creator_videos = bool(
+            input_data.get(
+                "deepCreatorVideos",
+                False,
+            )
+        )
+
         proxy_configuration = (
             await Actor.create_proxy_configuration(
                 actor_proxy_input=input_data.get(
@@ -1237,6 +1428,10 @@ async def main() -> None:
                     kv_store=kv_store,
                     log=log,
                     debug=debug,
+                    fallback_enabled=fallback_enabled,
+                    fallback_actor_id=fallback_actor_id,
+                    include_creator_videos=include_creator_videos,
+                    deep_creator_videos=deep_creator_videos,
                 )
                 for index in range(
                     worker_count
