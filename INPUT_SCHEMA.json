@@ -36,6 +36,27 @@
       "minimum": 1,
       "maximum": 1000
     },
+    "enrichSearchDetails": {
+      "title": "Enrich first search results with mobile product details",
+      "type": "boolean",
+      "description": "Use a TikTok Shop mobile API Actor for the first products to enrich price, stock, seller, images and any description exposed by the source. Avoids browser CAPTCHAs.",
+      "default": true
+    },
+    "maxDetailProducts": {
+      "title": "Maximum products to enrich",
+      "type": "integer",
+      "description": "Maximum number of search results to enrich with the mobile product detail Actor. Five is recommended.",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 5
+    },
+    "detailActorId": {
+      "title": "Mobile detail Actor ID",
+      "type": "string",
+      "description": "Apify Actor used to enrich product IDs without opening TikTok in a browser.",
+      "default": "cunning_soil/tiktok-shop-product-scraper-mobile-api",
+      "editor": "textfield"
+    },
     "captureSearchScreenshots": {
       "title": "Capture full-page screenshots for search results",
       "type": "boolean",
@@ -82,7 +103,6 @@
     "sortBy": {
       "title": "Sort results by",
       "type": "string",
-      "description": "Choose how the final product results should be sorted.",
       "editor": "select",
       "enum": [
         "discount",
@@ -94,7 +114,8 @@
         "Sold count",
         "Rating"
       ],
-      "default": "discount"
+      "default": "discount",
+      "description": "Choose how the final product results should be sorted."
     },
     "productUrls": {
       "title": "Product URLs",
