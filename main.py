@@ -403,14 +403,14 @@ async def main():
         capture_screenshots = input_data.get("captureScreenshots", False)
         debug = bool(input_data.get("debug", False))
 
-        proxy_configuration = await Actor.create_proxy_configuration(
-    actor_proxy_input=input_data.get("proxyConfiguration")
-)
+                proxy_configuration = await Actor.create_proxy_configuration(
+            actor_proxy_input=input_data.get("proxyConfiguration")
+        )
 
         kv_store = await KeyValueStore.open()
         request_queue = await Actor.open_request_queue()
 
-                added = 0
+        added = 0
 
         for item in start_items:
             url = item.get("url")
