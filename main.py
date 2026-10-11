@@ -1,523 +1,505 @@
 #!/usr/bin/env python3
 
-import asyncio
+from __future__ import annotations
+
 import hashlib
 import json
+import math
 import re
-import urllib.parse
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from apify import Actor
-from apify.storages import KeyValueStore
-from crawlee import Request
-from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
 
 
-# ---------------------
-# Constants / labels
-# ---------------------
-
-PRODUCT_LABEL = "PRODUCT"
-LISTING_LABEL = "LISTING"
-
-DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
-
-MOBILE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/16.0 Mobile/15E148 Safari/604.1"
-)
-
-DESKTOP_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/116.0.0.0 Safari/537.36"
-)
-
-PRODUCT_URL_MARKERS = (
-    "/shop/pdp/",
-    "/shop/product/",
-    "/view/product/",
-    "/product/",
-    "/item/",
-)
-
-DEFAULT_FALLBACK_ACTOR_ID = "jungle_synthesizer/tiktok-shop-product-detail-scraper"
 DEFAULT_SEARCH_ACTOR_ID = "getanyapi/tiktok-shop-scraper"
-DEFAULT_DETAIL_ACTOR_ID = "cunning_soil/tiktok-shop-product-scraper-mobile-api"
-
-
-# ---------------------
-# Helpers
-# ---------------------
-
-def slugify_tiktok_category(cat: str) -> str:
-    """Convert a category name/value to a URL-safe slug."""
-    cat = (cat or "").strip().lower()
-    cat = cat.replace("&", "and")
-    cat = re.sub(r"[^a-z0-9]+", "-", cat)
-    return cat.strip("-")
-
-
-def build_search_url_for_keyword(
-    keyword: str,
-    template: Optional[str] = None,
-) -> str:
-    """
-    Build a discovery URL.
-
-    NOTE:
-    TikTok changes its public discovery routes frequently. The default /tag/
-    route is only a best-effort discovery source, not a guaranteed TikTok Shop
-    search endpoint.
-    """
-    template = template or "https://www.tiktok.com/tag/{keyword}"
-    return template.format(keyword=urllib.parse.quote_plus(keyword))
-
-
-def normalize_start_items(raw_start_urls: Any) -> List[Dict[str, Any]]:
-    """Normalize string/list/dict URL inputs into a common list format."""
-    out: List[Dict[str, Any]] = []
-
-    if not raw_start_urls:
-        return out
-
-    if isinstance(raw_start_urls, str):
-        out.append({"url": raw_start_urls})
-        return out
-
-    if isinstance(raw_start_urls, list):
-        for item in raw_start_urls:
-            if isinstance(item, str):
-                out.append({"url": item})
-                continue
-
-            if isinstance(item, dict):
-                url = item.get("url")
-                if not url:
-                    continue
-
-                user_data = item.get("userData") or {}
-
-                if "label" in item:
-                    user_data["label"] = item["label"]
-
-                out.append(
-                    {
-                        "url": url,
-                        "userData": user_data,
-                    }
-                )
-
-    return out
-
-
-def choose_label_for_url(
-    url: str,
-    explicit_userdata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Classify a URL as a product page or a discovery/listing page."""
-    if explicit_userdata and explicit_userdata.get("label"):
-        return explicit_userdata
-
-    lower = (url or "").lower()
-
-    if any(marker in lower for marker in PRODUCT_URL_MARKERS):
-        return {"label": PRODUCT_LABEL}
-
-    if (
-        "/tag/" in lower
-        or "/collections/" in lower
-        or "/category/" in lower
-        or "/search" in lower
-        or "/shop/" in lower
-    ):
-        return {"label": LISTING_LABEL}
-
-    # Direct URLs supplied by the user are safer to treat as products by default.
-    return {"label": PRODUCT_LABEL}
-
-
-def is_product_candidate(url: str) -> bool:
-    lower = (url or "").lower()
-    return any(marker in lower for marker in PRODUCT_URL_MARKERS)
-
-
-def ms_timeouts_from_input(raw_timeouts: Dict[str, Any]) -> Dict[str, int]:
-    """Convert Actor timeout input values to milliseconds."""
-    out: Dict[str, int] = {
-        "navigation": DEFAULT_NAVIGATION_TIMEOUT_MS,
-        "request": DEFAULT_NAVIGATION_TIMEOUT_MS,
-    }
-
-    if not isinstance(raw_timeouts, dict):
-        return out
-
-    if "navigation" in raw_timeouts:
-        out["navigation"] = int(raw_timeouts["navigation"])
-    elif "navigationTimeoutSecs" in raw_timeouts:
-        out["navigation"] = int(raw_timeouts["navigationTimeoutSecs"]) * 1000
-
-    if "request" in raw_timeouts:
-        out["request"] = int(raw_timeouts["request"])
-    elif "requestTimeoutSecs" in raw_timeouts:
-        out["request"] = int(raw_timeouts["requestTimeoutSecs"]) * 1000
-
-    return out
-
-
-def to_playwright_proxy(proxy_url: Optional[str]) -> Optional[Dict[str, str]]:
-    """
-    Convert an authenticated proxy URL to the Playwright proxy format:
-    server + username + password.
-    """
-    if not proxy_url:
-        return None
-
-    parsed = urllib.parse.urlparse(proxy_url)
-
-    if not parsed.scheme or not parsed.hostname:
-        raise ValueError("Invalid proxy URL returned by Apify.")
-
-    server = f"{parsed.scheme}://{parsed.hostname}"
-
-    if parsed.port:
-        server += f":{parsed.port}"
-
-    proxy: Dict[str, str] = {"server": server}
-
-    if parsed.username:
-        proxy["username"] = urllib.parse.unquote(parsed.username)
-
-    if parsed.password:
-        proxy["password"] = urllib.parse.unquote(parsed.password)
-
-    return proxy
-
-
-def stable_key(prefix: str, value: str, extension: str) -> str:
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()
-    return f"{prefix}-{digest}.{extension}"
-
-
-def extract_product_id(url: str) -> Optional[str]:
-    """Best-effort extraction of a long numeric TikTok Shop product ID."""
-    matches = re.findall(r"(?<!\d)(\d{10,})(?!\d)", url or "")
-    return matches[-1] if matches else None
-
-
-def find_product_schema(value: Any) -> Optional[Dict[str, Any]]:
-    """Recursively find a JSON-LD object whose @type is Product."""
-    if isinstance(value, dict):
-        value_type = value.get("@type")
-
-        if value_type == "Product":
-            return value
-
-        if isinstance(value_type, list) and "Product" in value_type:
-            return value
-
-        for child in value.values():
-            found = find_product_schema(child)
-            if found:
-                return found
-
-    elif isinstance(value, list):
-        for child in value:
-            found = find_product_schema(child)
-            if found:
-                return found
-
-    return None
-
-
-def normalize_images(raw_images: Any) -> List[str]:
-    if isinstance(raw_images, str):
-        return [raw_images]
-
-    if isinstance(raw_images, list):
-        return [str(item) for item in raw_images if item]
-
-    return []
-
-
-def parse_json_ld_product(raw_scripts: List[str]) -> Dict[str, Any]:
-    """
-    Extract generic Product/Offer/Rating information from JSON-LD if the page
-    exposes it. Missing fields remain absent instead of being invented.
-    """
-    result: Dict[str, Any] = {}
-
-    for raw in raw_scripts:
-        raw = (raw or "").strip()
-        if not raw:
-            continue
-
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            continue
-
-        product = find_product_schema(parsed)
-        if not product:
-            continue
-
-        if product.get("name"):
-            result["name"] = product.get("name")
-
-        if product.get("description"):
-            result["description"] = product.get("description")
-
-        if product.get("sku"):
-            result["sku"] = str(product.get("sku"))
-
-        brand = product.get("brand")
-        if isinstance(brand, dict) and brand.get("name"):
-            result["brand"] = brand.get("name")
-        elif isinstance(brand, str):
-            result["brand"] = brand
-
-        images = normalize_images(product.get("image"))
-        if images:
-            result["images"] = images
-
-        offers = product.get("offers")
-
-        if isinstance(offers, list) and offers:
-            offers = offers[0]
-
-        if isinstance(offers, dict):
-            if offers.get("price") is not None:
-                result["price"] = offers.get("price")
-
-            if offers.get("priceCurrency"):
-                result["currency"] = offers.get("priceCurrency")
-
-            if offers.get("availability"):
-                result["availability"] = offers.get("availability")
-
-            if offers.get("url"):
-                result["offerUrl"] = offers.get("url")
-
-        aggregate_rating = product.get("aggregateRating")
-
-        if isinstance(aggregate_rating, dict):
-            if aggregate_rating.get("ratingValue") is not None:
-                result["rating"] = aggregate_rating.get("ratingValue")
-
-            if aggregate_rating.get("reviewCount") is not None:
-                result["reviewCount"] = aggregate_rating.get("reviewCount")
-            elif aggregate_rating.get("ratingCount") is not None:
-                result["reviewCount"] = aggregate_rating.get("ratingCount")
-
-        break
-
-    return result
-
-
-async def get_meta_content(page: Page, selector: str) -> Optional[str]:
-    try:
-        locator = page.locator(selector).first
-        if await locator.count() == 0:
-            return None
-
-        value = await locator.get_attribute("content")
-        return value.strip() if value else None
-    except Exception:
-        return None
-
-
-async def create_context_for_req(
-    browser: Browser,
-    accept_language: str,
-    proxy_url: Optional[str] = None,
-    use_mobile: bool = True,
-) -> BrowserContext:
-    """Create a Playwright browser context with locale and optional proxy."""
-    locale = (accept_language or "de-DE").split(",")[0].strip() or "de-DE"
-
-    context_kwargs: Dict[str, Any] = {
-        "user_agent": MOBILE_UA if use_mobile else DESKTOP_UA,
-        "locale": locale,
-        "java_script_enabled": True,
-        "extra_http_headers": {
-            "Accept-Language": accept_language
-            or "de-DE,de;q=0.9,en;q=0.8",
-        },
-    }
-
-    playwright_proxy = to_playwright_proxy(proxy_url)
-
-    if playwright_proxy:
-        context_kwargs["proxy"] = playwright_proxy
-
-    return await browser.new_context(**context_kwargs)
-
-
-async def fetch_and_save_response_for_debug(
-    page: Page,
-    resp: Optional[Response],
-    kv_store: KeyValueStore,
-    key_prefix: str,
-    log,
-) -> None:
-    """Save the response/page body for debugging."""
-    try:
-        if resp is None:
-            content = await page.content()
-            key = f"{key_prefix}.html"
-            await kv_store.set_value(
-                key,
-                content,
-                content_type="text/html",
-            )
-            log.info(f"[DEBUG] saved page.content() to kv://{key}")
-            return
-
-        headers = resp.headers or {}
-        content_type = headers.get("content-type", "").lower()
-        body_text = await resp.text()
-
-        if "html" in content_type or body_text.lstrip().startswith("<"):
-            key = f"{key_prefix}.html"
-            mime = "text/html"
-        elif (
-            "json" in content_type
-            or body_text.lstrip().startswith("{")
-            or body_text.lstrip().startswith("[")
-        ):
-            key = f"{key_prefix}.json"
-            mime = "application/json"
-        else:
-            key = f"{key_prefix}.txt"
-            mime = "text/plain"
-
-        await kv_store.set_value(
-            key,
-            body_text,
-            content_type=mime,
-        )
-
-        log.info(
-            f"[DEBUG] saved response to kv://{key} "
-            f"(status={resp.status})"
-        )
-    except Exception as exc:
-        log.warning(f"[DEBUG] Failed saving debug response: {exc}")
-
-
-async def auto_scroll_page(
-    page: Page,
-    scroll_step: int = 1200,
-    max_scrolls: int = 12,
-    wait_time_ms: int = 800,
-    log=None,
-) -> None:
-    """Scroll down to trigger lazy-loaded content."""
-    if log:
-        log.info(
-            f"[SCROLL] step={scroll_step}px max={max_scrolls}"
-        )
-
-    try:
-        last_height = await page.evaluate(
-            "() => document.body ? document.body.scrollHeight : 0"
-        )
-    except Exception:
-        return
-
-    for index in range(max_scrolls):
-        await page.evaluate(
-            f"window.scrollBy(0, {scroll_step});"
-        )
-        await page.wait_for_timeout(wait_time_ms)
-
-        new_height = await page.evaluate(
-            "() => document.body ? document.body.scrollHeight : 0"
-        )
-
-        if new_height == last_height:
-            if log:
-                log.info(
-                    f"[SCROLL] no more new content after "
-                    f"{index + 1} scrolls."
-                )
-            break
-
-        last_height = new_height
-
-    if log:
-        log.info(
-            f"[SCROLL] finished at height={last_height}"
-        )
-
-
-
-
-# ---------------------
-# Search provider (TikTok Shop DE / multi-market)
-# ---------------------
-
-def as_number(value: Any) -> Optional[float]:
+DEFAULT_HISTORY_STORE = "tiktok-shop-top-products-history"
+
+CATEGORY_QUERY_MAP = {
+    "beauty": "Beauty",
+    "fashion": "Fashion",
+    "electronics": "Elektronik",
+    "home": "Haushalt",
+    "pets": "Tierbedarf",
+    "sports": "Sport",
+    "food": "Lebensmittel",
+    "baby": "Baby",
+    "health": "Gesundheit",
+}
+
+CURRENCY_BY_REGION = {
+    "DE": "EUR",
+    "GB": "GBP",
+    "US": "USD",
+    "SG": "SGD",
+    "MY": "MYR",
+    "TH": "THB",
+    "VN": "VND",
+    "PH": "PHP",
+    "ID": "IDR",
+}
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def as_float(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
 
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            result = float(value)
+            return result if math.isfinite(result) else None
+        except (TypeError, ValueError):
+            return None
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    text = (
+        text.replace("%", "")
+        .replace("€", "")
+        .replace("$", "")
+        .replace("£", "")
+        .replace("\u00a0", "")
+        .replace(" ", "")
+    )
+
+    # European notation: 1.234,56 -> 1234.56
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    text = re.sub(r"[^0-9.\-]", "", text)
+
+    if not text or text in {"-", ".", "-."}:
+        return None
+
+    try:
+        result = float(text)
+        return result if math.isfinite(result) else None
+    except ValueError:
+        return None
+
+
+def as_int(value: Any) -> Optional[int]:
+    number = as_float(value)
+    if number is None:
+        return None
+    return int(round(number))
+
+
+def as_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
 
     if isinstance(value, str):
-        cleaned = value.strip().replace("%", "").replace(" ", "")
-        if not cleaned:
-            return None
-
-        # Handle common German decimal notation only when unambiguous.
-        if "," in cleaned and "." not in cleaned:
-            cleaned = cleaned.replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "in_stock", "available"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "out_of_stock", "unavailable"}:
+            return False
 
     return None
 
 
-def normalize_search_product(
-    raw: Dict[str, Any],
-    query: str,
-    provider_actor_id: str,
-    region: str,
-) -> Dict[str, Any]:
-    price = as_number(raw.get("price"))
-    original_price = as_number(raw.get("originalPrice"))
+def safe_percent_change(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None or previous is None or previous == 0:
+        return None
+    return round(((current - previous) / previous) * 100.0, 2)
 
-    discount_percent: Optional[float] = None
+
+def safe_delta(
+    current: Optional[float],
+    previous: Optional[float],
+    *,
+    counter: bool = False,
+) -> Optional[float]:
+    if current is None or previous is None:
+        return None
+
+    delta = current - previous
+
+    if counter and delta < 0:
+        # Cumulative counters should normally never decrease. Treat a decrease
+        # as a provider reset/data anomaly instead of producing negative sales.
+        return None
+
+    return round(delta, 4)
+
+
+def round_or_none(value: Optional[float], digits: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, digits)
+
+
+def sha1_text(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()
+
+
+def sanitize_store_name(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9-]+", "-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+
+    if not value:
+        value = DEFAULT_HISTORY_STORE
+
+    # Keep a conservative length.
+    return value[:63].strip("-") or DEFAULT_HISTORY_STORE
+
+
+def parse_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        # Milliseconds epoch.
+        if number > 10_000_000_000:
+            number /= 1000.0
+        try:
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    if text.isdigit():
+        return parse_datetime(int(text))
+
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(text)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def iso_or_none(value: Any) -> Optional[str]:
+    dt = parse_datetime(value)
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def recursive_find_with_key(
+    value: Any,
+    aliases: Iterable[str],
+) -> Tuple[Optional[str], Any]:
+    """
+    Find the first exact-key match, checking the current dict before descendants.
+    Returns (matched_key, value).
+    """
+    alias_set = set(aliases)
+
+    if isinstance(value, dict):
+        for key in alias_set:
+            if key in value and value[key] is not None:
+                return key, value[key]
+
+        for child in value.values():
+            found_key, found_value = recursive_find_with_key(child, alias_set)
+            if found_key is not None:
+                return found_key, found_value
+
+    elif isinstance(value, list):
+        for child in value:
+            found_key, found_value = recursive_find_with_key(child, alias_set)
+            if found_key is not None:
+                return found_key, found_value
+
+    return None, None
+
+
+def recursive_find_number(
+    value: Any,
+    aliases: Iterable[str],
+) -> Tuple[Optional[str], Optional[float]]:
+    key, raw = recursive_find_with_key(value, aliases)
+    return key, as_float(raw)
+
+
+def recursive_find_int(
+    value: Any,
+    aliases: Iterable[str],
+) -> Tuple[Optional[str], Optional[int]]:
+    key, raw = recursive_find_with_key(value, aliases)
+    return key, as_int(raw)
+
+
+def recursive_find_bool(
+    value: Any,
+    aliases: Iterable[str],
+) -> Tuple[Optional[str], Optional[bool]]:
+    key, raw = recursive_find_with_key(value, aliases)
+    return key, as_bool(raw)
+
+
+# ---------------------------------------------------------------------------
+# Provider normalization
+# ---------------------------------------------------------------------------
+
+def normalize_price(
+    raw_value: Any,
+    *,
+    mode: str,
+    divisor: float,
+    auto_minor_threshold: float,
+) -> Optional[float]:
+    value = as_float(raw_value)
+
+    if value is None:
+        return None
+
+    if mode == "raw":
+        return round(value, 2)
+
+    if mode == "minor_units":
+        if divisor <= 0:
+            raise ValueError("priceDivisor must be greater than 0.")
+        return round(value / divisor, 2)
+
+    # auto:
+    # - numbers containing decimals are treated as already-normalized currency
+    # - integer-like values >= threshold are interpreted as minor units
+    # - small integers are kept as major units
+    integer_like = abs(value - round(value)) < 1e-9
+
+    if integer_like and abs(value) >= auto_minor_threshold:
+        if divisor <= 0:
+            raise ValueError("priceDivisor must be greater than 0.")
+        return round(value / divisor, 2)
+
+    return round(value, 2)
+
+
+def normalize_commission_percent(raw: Dict[str, Any]) -> Tuple[Optional[float], Any, Optional[str]]:
+    key, raw_value = recursive_find_with_key(
+        raw,
+        (
+            "commissionPercent",
+            "commission_percent",
+            "commissionRate",
+            "commission_rate",
+            "affiliateCommissionRate",
+            "affiliate_commission_rate",
+            "commission",
+        ),
+    )
+
+    value = as_float(raw_value)
+
+    if value is None:
+        return None, raw_value, key
+
+    # Fractional rates such as 0.15 usually mean 15%.
+    if key and "rate" in key.lower() and 0 <= value <= 1:
+        value *= 100.0
+
+    if not 0 <= value <= 100:
+        return None, raw_value, key
+
+    return round(value, 2), raw_value, key
+
+
+def normalize_product(
+    raw: Dict[str, Any],
+    *,
+    query: str,
+    region: str,
+    provider_actor_id: str,
+    price_mode: str,
+    price_divisor: float,
+    auto_minor_threshold: float,
+    include_raw_provider_data: bool,
+) -> Dict[str, Any]:
+    price_raw = raw.get("price")
+    original_price_raw = raw.get("originalPrice")
+
+    current_price = normalize_price(
+        price_raw,
+        mode=price_mode,
+        divisor=price_divisor,
+        auto_minor_threshold=auto_minor_threshold,
+    )
+    original_price = normalize_price(
+        original_price_raw,
+        mode=price_mode,
+        divisor=price_divisor,
+        auto_minor_threshold=auto_minor_threshold,
+    )
+
+    raw_discount = as_float(
+        raw.get("discountPercent")
+        if raw.get("discountPercent") is not None
+        else raw.get("discount")
+    )
 
     if (
-        price is not None
+        current_price is not None
         and original_price is not None
+        and original_price > current_price
         and original_price > 0
-        and original_price > price
     ):
         discount_percent = round(
-            ((original_price - price) / original_price) * 100,
+            ((original_price - current_price) / original_price) * 100.0,
             2,
         )
+    elif raw_discount is not None and 0 <= raw_discount <= 100:
+        discount_percent = round(raw_discount, 2)
     else:
-        raw_discount = as_number(
-            raw.get("discountPercent")
-            if raw.get("discountPercent") is not None
-            else raw.get("discount")
-        )
-        if raw_discount is not None and 0 <= raw_discount <= 100:
-            discount_percent = round(raw_discount, 2)
+        discount_percent = None
 
-    return {
+    stock_key, stock = recursive_find_int(
+        raw,
+        (
+            "availableQuantity",
+            "available_quantity",
+            "stock",
+            "stockCount",
+            "stock_count",
+            "totalStock",
+            "total_stock",
+            "inventoryCount",
+            "inventory_count",
+            "quantityAvailable",
+            "quantity_available",
+        ),
+    )
+
+    in_stock_key, in_stock = recursive_find_bool(
+        raw,
+        (
+            "inStock",
+            "in_stock",
+            "isInStock",
+            "is_in_stock",
+            "available",
+            "isAvailable",
+            "is_available",
+        ),
+    )
+
+    if in_stock is None and stock is not None:
+        in_stock = stock > 0
+
+    creator_key, creator_count = recursive_find_int(
+        raw,
+        (
+            "creatorCount",
+            "creator_count",
+            "affiliateCreatorCount",
+            "affiliate_creator_count",
+            "creatorsCount",
+            "creators_count",
+            "creator_num",
+        ),
+    )
+
+    video_key, video_count = recursive_find_int(
+        raw,
+        (
+            "videoCount",
+            "video_count",
+            "creatorVideoCount",
+            "creator_video_count",
+            "creatorVideosCount",
+            "creator_videos_count",
+        ),
+    )
+
+    views_key, views = recursive_find_int(
+        raw,
+        (
+            "views",
+            "viewCount",
+            "view_count",
+            "videoViews",
+            "video_views",
+            "totalViews",
+            "total_views",
+        ),
+    )
+
+    likes_key, likes = recursive_find_int(
+        raw,
+        ("likes", "likeCount", "like_count", "totalLikes", "total_likes"),
+    )
+    comments_key, comments = recursive_find_int(
+        raw,
+        ("comments", "commentCount", "comment_count", "totalComments", "total_comments"),
+    )
+    shares_key, shares = recursive_find_int(
+        raw,
+        ("shares", "shareCount", "share_count", "totalShares", "total_shares"),
+    )
+
+    engagement_rate = None
+    if views is not None and views > 0:
+        engagement_total = sum(
+            value or 0
+            for value in (likes, comments, shares)
+        )
+        engagement_rate = round((engagement_total / views) * 100.0, 4)
+
+    commission_percent, commission_raw, commission_key = normalize_commission_percent(raw)
+
+    listed_key, listed_raw = recursive_find_with_key(
+        raw,
+        (
+            "listedAt",
+            "listed_at",
+            "createdAt",
+            "created_at",
+            "createTime",
+            "create_time",
+            "publishTime",
+            "publish_time",
+        ),
+    )
+    listed_at = iso_or_none(listed_raw)
+
+    currency = raw.get("currency")
+    currency_inferred = False
+
+    if not currency:
+        currency = CURRENCY_BY_REGION.get(region.upper())
+        currency_inferred = currency is not None
+
+    product: Dict[str, Any] = {
         "type": "product",
         "source": raw.get("source") or provider_actor_id,
         "searchQuery": query,
+        "searchQueries": [query],
         "region": region.upper(),
         "productId": str(raw.get("productId")) if raw.get("productId") is not None else None,
         "title": raw.get("title"),
@@ -526,79 +508,84 @@ def normalize_search_product(
             or raw.get("productDescription")
             or raw.get("product_description")
         ),
-        "price": price,
-        "originalPrice": original_price,
-        "discountPercent": discount_percent,
-        "currency": raw.get("currency"),
-        "soldCount": raw.get("soldCount"),
-        "rating": raw.get("rating"),
-        "reviewCount": raw.get("reviewCount"),
+        "productUrl": raw.get("url") or raw.get("productUrl"),
+        "image": raw.get("image"),
         "shopName": raw.get("shopName"),
         "sellerId": str(raw.get("sellerId")) if raw.get("sellerId") is not None else None,
-        "image": raw.get("image"),
-        "productUrl": raw.get("url"),
+
+        # Price
+        "priceRaw": price_raw,
+        "originalPriceRaw": original_price_raw,
+        "currentPrice": current_price,
+        "originalPrice": original_price,
+        "currency": currency,
+        "currencyInferred": currency_inferred,
+        "discountPercent": discount_percent,
+        "priceNormalizationMode": price_mode,
+
+        # Product performance
+        "soldCount": as_int(raw.get("soldCount")),
+        "rating": as_float(raw.get("rating")),
+        "reviewCount": as_int(raw.get("reviewCount")),
+
+        # Creator / content
+        "creatorCount": creator_count,
+        "videoCount": video_count,
+        "views": views,
+        "likes": likes,
+        "comments": comments,
+        "shares": shares,
+        "engagementRate": engagement_rate,
+
+        # Affiliate
+        "commissionPercent": commission_percent,
+
+        # Stock
+        "stock": stock,
+        "inStock": in_stock,
+
+        # Age
+        "listedAt": listed_at,
+
+        # Diagnostics showing which provider key supplied optional fields.
+        "providerFieldKeys": {
+            "stock": stock_key,
+            "inStock": in_stock_key,
+            "creatorCount": creator_key,
+            "videoCount": video_key,
+            "views": views_key,
+            "likes": likes_key,
+            "comments": comments_key,
+            "shares": shares_key,
+            "commission": commission_key,
+            "listedAt": listed_key,
+        },
+        "commissionRaw": commission_raw,
     }
 
+    if include_raw_provider_data:
+        product["rawProviderData"] = raw
 
-def product_passes_filters(
-    product: Dict[str, Any],
-    only_discounted: bool,
-    min_discount: float,
-    min_sold: int,
-    min_rating: float,
-) -> bool:
-    discount = as_number(product.get("discountPercent")) or 0.0
-    sold = as_number(product.get("soldCount")) or 0.0
-    rating = as_number(product.get("rating")) or 0.0
-
-    if only_discounted and discount <= 0:
-        return False
-
-    if discount < min_discount:
-        return False
-
-    if sold < min_sold:
-        return False
-
-    if rating < min_rating:
-        return False
-
-    return True
+    return product
 
 
-def sort_products(
-    products: List[Dict[str, Any]],
-    sort_by: str,
-) -> List[Dict[str, Any]]:
-    sort_by = (sort_by or "discount").lower()
-
-    if sort_by == "sold":
-        key = lambda p: (
-            as_number(p.get("soldCount")) or 0.0,
-            as_number(p.get("discountPercent")) or 0.0,
-        )
-    elif sort_by == "rating":
-        key = lambda p: (
-            as_number(p.get("rating")) or 0.0,
-            as_number(p.get("soldCount")) or 0.0,
-        )
-    else:
-        key = lambda p: (
-            as_number(p.get("discountPercent")) or 0.0,
-            as_number(p.get("soldCount")) or 0.0,
-        )
-
-    return sorted(products, key=key, reverse=True)
-
+# ---------------------------------------------------------------------------
+# Search provider
+# ---------------------------------------------------------------------------
 
 async def call_search_provider(
+    *,
     query: str,
     region: str,
     max_items: int,
     search_actor_id: str,
+    price_mode: str,
+    price_divisor: float,
+    auto_minor_threshold: float,
+    include_raw_provider_data: bool,
     log,
-) -> tuple[List[Dict[str, Any]], Optional[str]]:
-    search_input = {
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    run_input = {
         "query": query,
         "country": region.upper(),
         "maxItems": max_items,
@@ -606,13 +593,13 @@ async def call_search_provider(
 
     try:
         log.info(
-            f"[SEARCH] Calling {search_actor_id} "
-            f"query={query!r}, country={region.upper()}, maxItems={max_items}"
+            f"[SEARCH] Actor={search_actor_id} query={query!r} "
+            f"country={region.upper()} maxItems={max_items}"
         )
 
         run = await Actor.call(
             actor_id=search_actor_id,
-            run_input=search_input,
+            run_input=run_input,
         )
 
         if run is None:
@@ -623,1330 +610,700 @@ async def call_search_provider(
         page = await dataset_client.list_items(limit=max_items)
         raw_items = page.items or []
 
-        products = [
-            normalize_search_product(
-                raw=item,
-                query=query,
-                provider_actor_id=search_actor_id,
-                region=region,
+        products: List[Dict[str, Any]] = []
+
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+
+            products.append(
+                normalize_product(
+                    raw,
+                    query=query,
+                    region=region,
+                    provider_actor_id=search_actor_id,
+                    price_mode=price_mode,
+                    price_divisor=price_divisor,
+                    auto_minor_threshold=auto_minor_threshold,
+                    include_raw_provider_data=include_raw_provider_data,
+                )
             )
-            for item in raw_items
-            if isinstance(item, dict)
-        ]
 
-        log.info(
-            f"[SEARCH] {query!r}: received {len(products)} products"
-        )
-
+        log.info(f"[SEARCH] {query!r}: {len(products)} products")
         return products, None
 
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
-        log.warning(f"[SEARCH] Failed for {query!r}: {message}")
+        log.warning(f"[SEARCH] {query!r} failed: {message}")
         return [], message
 
 
-# ---------------------
-# External product fallback
-# ---------------------
+def deduplicate_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
 
-def normalize_fallback_product(
-    raw: Dict[str, Any],
-    source_url: str,
-    fallback_actor_id: str,
-) -> Dict[str, Any]:
-    """
-    Normalize the documented output of the fallback TikTok Shop product Actor
-    to the stable camelCase schema used by this Actor.
-    """
-    return {
-        "type": "product",
-        "source": fallback_actor_id,
-        "fallbackUsed": True,
-        "sourceUrl": source_url,
-        "productId": raw.get("product_id"),
-        "title": raw.get("product_name"),
-        "description": raw.get("description"),
-        "brand": raw.get("brand"),
-        "categoryPath": raw.get("category_path"),
-        "price": raw.get("price"),
-        "originalPrice": raw.get("original_price"),
-        "currency": raw.get("currency"),
-        "discountPercent": raw.get("discount_percent"),
-        "soldCount": raw.get("sold_count"),
-        "availableQuantity": raw.get("available_quantity"),
-        "inStock": raw.get("in_stock"),
-        "rating": raw.get("rating"),
-        "reviewCount": raw.get("review_count"),
-        "images": raw.get("images") or [],
-        "videos": raw.get("videos") or [],
-        "variants": raw.get("variants") or [],
-        "shopName": raw.get("shop_name"),
-        "shopId": raw.get("shop_id"),
-        "productUrl": raw.get("product_url"),
-        "region": raw.get("region"),
-        "creatorVideos": raw.get("creator_videos") or [],
-        "creatorVideosCount": raw.get("creator_videos_count"),
-        "scrapedAt": raw.get("scrapedAt"),
-    }
-
-
-async def call_product_fallback(
-    source_url: str,
-    region: str,
-    include_creator_videos: bool,
-    deep_creator_videos: bool,
-    fallback_actor_id: str,
-    log,
-) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Call a second Apify Actor only when direct Playwright access is blocked.
-
-    Returns:
-        (normalized_product, None) on success
-        (None, error_message) on failure
-    """
-    item = extract_product_id(source_url) or source_url
-    country = (region or "DE").strip().lower()
-
-    fallback_input = {
-        "items": [item],
-        "country": country,
-        "maxItems": 1,
-        "includeCreatorVideos": bool(include_creator_videos),
-        "deepCreatorVideos": bool(deep_creator_videos),
-    }
-
-    try:
-        log.info(
-            f"[FALLBACK] Calling {fallback_actor_id} "
-            f"for item={item}, country={country}"
+    for product in products:
+        identity = (
+            product.get("productId")
+            or product.get("productUrl")
+            or product.get("title")
         )
 
-        run = await Actor.call(
-            actor_id=fallback_actor_id,
-            run_input=fallback_input,
-        )
-
-        if run is None:
-            return None, "Fallback Actor failed to start."
-
-        run_client = Actor.apify_client.run(run.id)
-        dataset_client = run_client.dataset()
-        page = await dataset_client.list_items(limit=1)
-
-        items = page.items or []
-
-        if not items:
-            return None, "Fallback Actor returned no product records."
-
-        raw = items[0]
-
-        if not isinstance(raw, dict):
-            return None, "Fallback Actor returned an unexpected result type."
-
-        product = normalize_fallback_product(
-            raw=raw,
-            source_url=source_url,
-            fallback_actor_id=fallback_actor_id,
-        )
-
-        if not product.get("productId") and not product.get("title"):
-            return None, "Fallback Actor returned an incomplete product record."
-
-        log.info(
-            f"[FALLBACK] Success: "
-            f"productId={product.get('productId')}, "
-            f"title={product.get('title')!r}"
-        )
-
-        return product, None
-
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {exc}"
-        log.warning(f"[FALLBACK] Failed: {message}")
-        return None, message
-
-
-# ---------------------
-# Product task
-# ---------------------
-
-async def process_product_task(
-    browser: Browser,
-    req: Request,
-    proxy_url: Optional[str],
-    accept_language: str,
-    region: str,
-    timeouts: Dict[str, Any],
-    capture_screenshots: bool,
-    kv_store: KeyValueStore,
-    log,
-    debug: bool = False,
-    fallback_enabled: bool = True,
-    fallback_actor_id: str = DEFAULT_FALLBACK_ACTOR_ID,
-    include_creator_videos: bool = False,
-    deep_creator_videos: bool = False,
-) -> None:
-    url = req.url
-    log.info(f"[PRODUCT] {url}")
-
-    context: Optional[BrowserContext] = None
-    page: Optional[Page] = None
-    response: Optional[Response] = None
-
-    try:
-        context = await create_context_for_req(
-            browser,
-            accept_language,
-            proxy_url,
-            use_mobile=True,
-        )
-        page = await context.new_page()
-
-        response = await page.goto(
-            url,
-            timeout=timeouts.get(
-                "navigation",
-                DEFAULT_NAVIGATION_TIMEOUT_MS,
-            ),
-            wait_until="domcontentloaded",
-        )
-
-        await page.wait_for_timeout(2_000)
-
-        final_url = page.url
-        status = response.status if response else None
-
-        try:
-            page_title = await page.title()
-        except Exception:
-            page_title = None
-
-        # Detect TikTok anti-bot / security challenge.
-        challenge_markers = (
-            "security check",
-            "verify to continue",
-            "verification",
-            "captcha",
-        )
-        normalized_title = (page_title or "").strip().lower()
-
-        if any(marker in normalized_title for marker in challenge_markers):
-            log.warning(
-                f"[PRODUCT] TikTok security challenge detected: {url}"
-            )
-
-            # Keep diagnostics from our own scraper.
-            if debug:
-                try:
-                    key = stable_key(
-                        "security-check",
-                        url,
-                        "html",
-                    )
-                    await kv_store.set_value(
-                        key,
-                        await page.content(),
-                        content_type="text/html",
-                    )
-                    log.info(
-                        f"[PRODUCT] security-check HTML saved to kv://{key}"
-                    )
-                except Exception as exc:
-                    log.warning(
-                        f"[PRODUCT] Could not save security-check HTML: {exc}"
-                    )
-
-            if capture_screenshots:
-                try:
-                    key = stable_key(
-                        "security-check",
-                        url,
-                        "png",
-                    )
-                    await kv_store.set_value(
-                        key,
-                        await page.screenshot(full_page=True),
-                        content_type="image/png",
-                    )
-                    log.info(
-                        f"[PRODUCT] security-check screenshot saved to kv://{key}"
-                    )
-                except Exception as exc:
-                    log.warning(
-                        f"[PRODUCT] Could not save security-check screenshot: {exc}"
-                    )
-
-            # Fallback to a dedicated TikTok Shop detail Actor.
-            if fallback_enabled:
-                product, fallback_error = await call_product_fallback(
-                    source_url=url,
-                    region=region,
-                    include_creator_videos=include_creator_videos,
-                    deep_creator_videos=deep_creator_videos,
-                    fallback_actor_id=fallback_actor_id,
-                    log=log,
-                )
-
-                if product is not None:
-                    await Actor.push_data(product)
-                    return
-            else:
-                fallback_error = "Fallback disabled by input."
-
-            # If fallback also fails, return a clean blocked record.
-            await Actor.push_data(
-                {
-                    "type": "blocked",
-                    "sourceUrl": url,
-                    "finalUrl": page.url,
-                    "productId": extract_product_id(page.url)
-                    or extract_product_id(url),
-                    "region": region,
-                    "httpStatus": status,
-                    "reason": "TIKTOK_SECURITY_CHECK",
-                    "title": page_title,
-                    "fallbackUsed": bool(fallback_enabled),
-                    "fallbackActor": (
-                        fallback_actor_id
-                        if fallback_enabled
-                        else None
-                    ),
-                    "fallbackError": fallback_error,
-                }
-            )
-            return
-
-        og_title = await get_meta_content(
-            page,
-            'meta[property="og:title"]',
-        )
-        description = (
-            await get_meta_content(
-                page,
-                'meta[property="og:description"]',
-            )
-            or await get_meta_content(
-                page,
-                'meta[name="description"]',
-            )
-        )
-
-        try:
-            canonical = await page.locator(
-                'link[rel="canonical"]'
-            ).first.get_attribute("href")
-        except Exception:
-            canonical = None
-
-        try:
-            raw_json_ld = await page.locator(
-                'script[type="application/ld+json"]'
-            ).all_text_contents()
-        except Exception:
-            raw_json_ld = []
-
-        structured = parse_json_ld_product(raw_json_ld)
-
-        record: Dict[str, Any] = {
-            "type": "product",
-            "sourceUrl": url,
-            "finalUrl": final_url,
-            "productId": extract_product_id(final_url)
-            or extract_product_id(url),
-            "region": region,
-            "httpStatus": status,
-            "title": (
-                structured.get("name")
-                or og_title
-                or page_title
-            ),
-            "description": (
-                structured.get("description")
-                or description
-            ),
-            "canonicalUrl": canonical,
-        }
-
-        for field in (
-            "sku",
-            "brand",
-            "images",
-            "price",
-            "currency",
-            "availability",
-            "rating",
-            "reviewCount",
-            "offerUrl",
-        ):
-            if structured.get(field) is not None:
-                record[field] = structured[field]
-
-        await Actor.push_data(record)
-
-        log.info(
-            f"[PRODUCT] pushed data for {url}: "
-            f"title={record.get('title')!r}, "
-            f"status={status}, final_url={final_url}"
-        )
-
-        if debug:
-            key_prefix = stable_key(
-                "debug-product",
-                url,
-                "response",
-            ).rsplit(".", 1)[0]
-
-            await fetch_and_save_response_for_debug(
-                page,
-                response,
-                kv_store,
-                key_prefix,
-                log,
-            )
-
-        if capture_screenshots:
-            screenshot = await page.screenshot(
-                full_page=True
-            )
-            key = stable_key(
-                "screenshot-product",
-                url,
-                "png",
-            )
-            await kv_store.set_value(
-                key,
-                screenshot,
-                content_type="image/png",
-            )
-            log.info(
-                f"[PRODUCT] screenshot saved to kv://{key}"
-            )
-
-    except Exception as exc:
-        log.warning(f"[PRODUCT] error {url}: {exc}")
-
-        # Save useful failure diagnostics instead of crashing the entire Actor.
-        error_record = {
-            "type": "product_error",
-            "sourceUrl": url,
-            "region": region,
-            "error": str(exc),
-        }
-
-        if page is not None:
-            error_record["finalUrl"] = page.url
-
-            if debug:
-                try:
-                    key = stable_key(
-                        "debug-product-error",
-                        url,
-                        "html",
-                    )
-                    await kv_store.set_value(
-                        key,
-                        await page.content(),
-                        content_type="text/html",
-                    )
-                except Exception:
-                    pass
-
-            if capture_screenshots:
-                try:
-                    key = stable_key(
-                        "screenshot-product-error",
-                        url,
-                        "png",
-                    )
-                    await kv_store.set_value(
-                        key,
-                        await page.screenshot(full_page=True),
-                        content_type="image/png",
-                    )
-                except Exception:
-                    pass
-
-        await Actor.push_data(error_record)
-
-    finally:
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
-
-        if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
-
-
-# ---------------------
-# Listing / discovery task
-# ---------------------
-
-async def process_listing_task(
-    browser: Browser,
-    req: Request,
-    proxy_url: Optional[str],
-    accept_language: str,
-    region: str,
-    timeouts: Dict[str, Any],
-    request_queue,
-    log,
-    kv_store: KeyValueStore,
-    debug: bool = False,
-) -> None:
-    url = req.url
-    log.info(f"[LISTING] {url}")
-
-    context: Optional[BrowserContext] = None
-    page: Optional[Page] = None
-    response: Optional[Response] = None
-
-    try:
-        context = await create_context_for_req(
-            browser,
-            accept_language,
-            proxy_url,
-            use_mobile=True,
-        )
-        page = await context.new_page()
-
-        response = await page.goto(
-            url,
-            timeout=timeouts.get(
-                "navigation",
-                DEFAULT_NAVIGATION_TIMEOUT_MS,
-            ),
-            wait_until="domcontentloaded",
-        )
-
-        await page.wait_for_timeout(1_500)
-        await auto_scroll_page(page, log=log)
-
-        if debug:
-            key_prefix = stable_key(
-                "debug-listing",
-                url,
-                "response",
-            ).rsplit(".", 1)[0]
-
-            await fetch_and_save_response_for_debug(
-                page,
-                response,
-                kv_store,
-                key_prefix,
-                log,
-            )
-
-        anchors = await page.query_selector_all("a")
-        candidates: List[str] = []
-
-        for anchor in anchors:
-            href = await anchor.get_attribute("href")
-
-            if not href:
-                continue
-
-            href = href.strip()
-
-            if (
-                href.startswith("javascript:")
-                or href.startswith("#")
-            ):
-                continue
-
-            absolute_url = urllib.parse.urljoin(
-                page.url,
-                href,
-            )
-
-            if is_product_candidate(absolute_url):
-                candidates.append(absolute_url)
-
-        unique_candidates = list(
-            dict.fromkeys(candidates)
-        )
-
-        for candidate in unique_candidates:
-            await request_queue.add_request(
-                Request.from_url(
-                    candidate,
-                    label=PRODUCT_LABEL,
-                )
-            )
-
-            log.info(
-                f"[LISTING] queued product: {candidate}"
-            )
-
-        await Actor.push_data(
-            {
-                "type": "listing",
-                "sourceUrl": url,
-                "finalUrl": page.url,
-                "region": region,
-                "httpStatus": (
-                    response.status
-                    if response
-                    else None
-                ),
-                "productsDiscovered": len(
-                    unique_candidates
-                ),
-            }
-        )
-
-        if not unique_candidates:
-            log.info(
-                f"[LISTING] no product candidates found "
-                f"on {url}"
-            )
-
-    except Exception as exc:
-        log.warning(f"[LISTING] error {url}: {exc}")
-
-        await Actor.push_data(
-            {
-                "type": "listing_error",
-                "sourceUrl": url,
-                "region": region,
-                "error": str(exc),
-                "finalUrl": (
-                    page.url
-                    if page is not None
-                    else None
-                ),
-            }
-        )
-
-    finally:
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
-
-        if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
-
-
-# ---------------------
-# Worker
-# ---------------------
-
-async def worker_loop(
-    worker_id: int,
-    browser: Browser,
-    request_queue,
-    proxy_configuration,
-    accept_language: str,
-    region: str,
-    timeouts: Dict[str, Any],
-    capture_screenshots: bool,
-    kv_store: KeyValueStore,
-    log,
-    debug: bool,
-    fallback_enabled: bool,
-    fallback_actor_id: str,
-    include_creator_videos: bool,
-    deep_creator_videos: bool,
-) -> None:
-    log.info(f"Worker {worker_id} started")
-
-    while True:
-        req = await request_queue.fetch_next_request()
-
-        if req is None:
-            try:
-                if await request_queue.is_finished():
-                    break
-            except Exception:
-                break
-
-            await asyncio.sleep(0.25)
+        if not identity:
             continue
 
-        label = req.label or PRODUCT_LABEL
+        identity = str(identity)
 
-        proxy_url: Optional[str] = None
+        if identity not in deduped:
+            deduped[identity] = product
+            continue
 
-        if proxy_configuration is not None:
-            try:
-                proxy_url = await proxy_configuration.new_url()
-            except Exception as exc:
-                log.warning(
-                    f"[PROXY] Could not obtain proxy URL: {exc}"
-                )
+        existing = deduped[identity]
+        queries = list(existing.get("searchQueries") or [])
 
-        try:
-            if label == PRODUCT_LABEL:
-                await process_product_task(
-                    browser,
-                    req,
-                    proxy_url,
-                    accept_language,
-                    region,
-                    timeouts,
-                    capture_screenshots,
-                    kv_store,
-                    log,
-                    debug,
-                    fallback_enabled,
-                    fallback_actor_id,
-                    include_creator_videos,
-                    deep_creator_videos,
-                )
-            else:
-                await process_listing_task(
-                    browser,
-                    req,
-                    proxy_url,
-                    accept_language,
-                    region,
-                    timeouts,
-                    request_queue,
-                    log,
-                    kv_store,
-                    debug,
-                )
+        for query in product.get("searchQueries") or []:
+            if query not in queries:
+                queries.append(query)
 
-        finally:
-            try:
-                await request_queue.mark_request_as_handled(
-                    req
-                )
-            except Exception as exc:
-                log.warning(
-                    f"[QUEUE] Could not mark request handled: {exc}"
-                )
+        existing["searchQueries"] = queries
 
-    log.info(f"Worker {worker_id} finished")
+    return list(deduped.values())
 
 
+# ---------------------------------------------------------------------------
+# Persistent history / snapshots
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_FIELDS = (
+    "soldCount",
+    "currentPrice",
+    "reviewCount",
+    "creatorCount",
+    "views",
+    "likes",
+    "comments",
+    "shares",
+    "commissionPercent",
+    "stock",
+    "inStock",
+    "rating",
+    "discountPercent",
+)
 
 
-# ---------------------
-# Mobile detail enrichment
-# ---------------------
+def build_snapshot(product: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    snapshot = {"timestamp": now.isoformat()}
 
-def parse_money_text(value: Any) -> Optional[float]:
-    """Extract a numeric amount from values such as '€18,84' or '$59.99'."""
-    if value is None:
-        return None
+    for field in SNAPSHOT_FIELDS:
+        snapshot[field] = product.get(field)
 
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-
-    raw = str(value).strip()
-    if not raw:
-        return None
-
-    # Keep digits, decimal separators and minus sign only.
-    cleaned = re.sub(r"[^0-9,.\-]", "", raw)
-
-    if not cleaned:
-        return None
-
-    # German/European decimal notation.
-    if "," in cleaned and "." not in cleaned:
-        cleaned = cleaned.replace(",", ".")
-    elif "," in cleaned and "." in cleaned:
-        # Decide decimal separator by the last separator.
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "").replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
+    return snapshot
 
 
-def find_first_text_by_keys(
-    value: Any,
-    keys: tuple[str, ...],
-) -> Optional[str]:
-    """
-    Recursively find the first non-empty string under one of the exact keys.
-    This is intentionally conservative so we do not invent a description.
-    """
-    if isinstance(value, dict):
-        for key in keys:
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
+def valid_history_items(raw_history: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_history, list):
+        return []
 
-        for child in value.values():
-            found = find_first_text_by_keys(child, keys)
-            if found:
-                return found
+    out: List[Dict[str, Any]] = []
 
-    elif isinstance(value, list):
-        for child in value:
-            found = find_first_text_by_keys(child, keys)
-            if found:
-                return found
+    for item in raw_history:
+        if not isinstance(item, dict):
+            continue
 
+        dt = parse_datetime(item.get("timestamp"))
+        if dt is None:
+            continue
+
+        normalized = dict(item)
+        normalized["timestamp"] = dt.astimezone(timezone.utc).isoformat()
+        out.append(normalized)
+
+    out.sort(
+        key=lambda item: parse_datetime(item.get("timestamp"))
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return out
+
+
+def nearest_snapshot(
+    history: List[Dict[str, Any]],
+    target: datetime,
+    tolerance_hours: float,
+) -> Optional[Dict[str, Any]]:
+    best: Optional[Dict[str, Any]] = None
+    best_distance: Optional[float] = None
+
+    for item in history:
+        dt = parse_datetime(item.get("timestamp"))
+        if dt is None:
+            continue
+
+        distance = abs((dt - target).total_seconds()) / 3600.0
+
+        if distance <= tolerance_hours and (
+            best_distance is None or distance < best_distance
+        ):
+            best = item
+            best_distance = distance
+
+    return best
+
+
+def latest_snapshot_with_value(
+    history: List[Dict[str, Any]],
+    field: str,
+) -> Optional[Dict[str, Any]]:
+    for item in reversed(history):
+        if item.get(field) is not None:
+            return item
     return None
 
 
-def extract_mobile_detail_product(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Extract the first product from the mobile Actor's full_readable output.
-    The Actor returns a wrapper with product_info.products.
-    """
-    product_info = raw.get("product_info")
-
-    if not isinstance(product_info, dict):
+def calculate_counter_delta(
+    current: Any,
+    baseline: Optional[Dict[str, Any]],
+    field: str,
+) -> Optional[float]:
+    if baseline is None:
         return None
 
-    products = product_info.get("products")
+    return safe_delta(
+        as_float(current),
+        as_float(baseline.get(field)),
+        counter=True,
+    )
 
-    if not isinstance(products, list) or not products:
+
+def calculate_regular_delta(
+    current: Any,
+    baseline: Optional[Dict[str, Any]],
+    field: str,
+) -> Optional[float]:
+    if baseline is None:
         return None
 
-    first = products[0]
+    return safe_delta(
+        as_float(current),
+        as_float(baseline.get(field)),
+        counter=False,
+    )
 
-    return first if isinstance(first, dict) else None
+
+def percent_growth_from_counts(
+    current: Any,
+    baseline: Optional[Dict[str, Any]],
+    field: str,
+) -> Optional[float]:
+    if baseline is None:
+        return None
+
+    return safe_percent_change(
+        as_float(current),
+        as_float(baseline.get(field)),
+    )
 
 
-def merge_mobile_detail_into_product(
+def compute_history_metrics(
     product: Dict[str, Any],
-    raw: Dict[str, Any],
-    detail_actor_id: str,
-) -> None:
-    """Merge verified detail fields into the existing search result."""
-    detail = extract_mobile_detail_product(raw)
+    *,
+    history: List[Dict[str, Any]],
+    first_seen: datetime,
+    now: datetime,
+    tolerance_hours: float,
+) -> Dict[str, Any]:
+    target_24h = now - timedelta(hours=24)
+    target_7d = now - timedelta(days=7)
+    target_14d = now - timedelta(days=14)
 
-    if detail is None:
-        product["detailStatus"] = "NO_PRODUCT_IN_RESPONSE"
-        return
+    baseline_24h = nearest_snapshot(history, target_24h, tolerance_hours)
+    baseline_7d = nearest_snapshot(history, target_7d, tolerance_hours)
+    baseline_14d = nearest_snapshot(history, target_14d, tolerance_hours)
 
-    product["detailStatus"] = "AVAILABLE"
-    product["detailSource"] = detail_actor_id
+    sold24h = calculate_counter_delta(product.get("soldCount"), baseline_24h, "soldCount")
+    sold7d = calculate_counter_delta(product.get("soldCount"), baseline_7d, "soldCount")
 
-    if detail.get("product_id") is not None:
-        product["productId"] = str(detail.get("product_id"))
+    previous_7d_sales = None
 
-    if detail.get("title"):
-        product["title"] = detail.get("title")
-
-    category = detail.get("category")
-    if isinstance(category, dict):
-        if category.get("name"):
-            product["categoryName"] = category.get("name")
-        if category.get("id") is not None:
-            product["categoryId"] = str(category.get("id"))
-
-    pricing = detail.get("pricing")
-    if isinstance(pricing, dict):
-        sale_price_text = pricing.get("sale_price")
-        original_price_text = pricing.get("original_price")
-        currency = pricing.get("currency")
-
-        product["priceText"] = sale_price_text
-        product["originalPriceText"] = original_price_text
-
-        parsed_sale = parse_money_text(sale_price_text)
-        parsed_original = parse_money_text(original_price_text)
-
-        if parsed_sale is not None:
-            # Replace ambiguous search-provider price with detail price.
-            product["price"] = parsed_sale
-            product["priceSource"] = detail_actor_id
-
-        if parsed_original is not None:
-            product["originalPrice"] = parsed_original
-
-        if currency:
-            product["currency"] = currency
-
-        if (
-            parsed_sale is not None
-            and parsed_original is not None
-            and parsed_original > 0
-            and parsed_original > parsed_sale
-        ):
-            product["discountPercent"] = round(
-                ((parsed_original - parsed_sale) / parsed_original) * 100,
-                2,
-            )
-
-    sales = detail.get("sales")
-    if isinstance(sales, dict) and sales.get("sold_count") is not None:
-        product["soldCount"] = sales.get("sold_count")
-
-    inventory = detail.get("inventory")
-    if isinstance(inventory, dict):
-        if inventory.get("total_stock") is not None:
-            product["totalStock"] = inventory.get("total_stock")
-
-        skus = inventory.get("skus")
-        if isinstance(skus, list):
-            product["skus"] = skus
-
-    media = detail.get("media")
-    if isinstance(media, dict):
-        image_urls = media.get("image_urls")
-        if isinstance(image_urls, list) and image_urls:
-            product["images"] = image_urls
-            product["image"] = image_urls[0]
-
-    seller = detail.get("seller")
-    if isinstance(seller, dict):
-        if seller.get("name"):
-            product["shopName"] = seller.get("name")
-        if seller.get("seller_id") is not None:
-            product["sellerId"] = str(seller.get("seller_id"))
-        if seller.get("rating") is not None:
-            product["shopRating"] = seller.get("rating")
-        if seller.get("location"):
-            product["sellerLocation"] = seller.get("location")
-
-    # Best-effort product description from any explicit description field
-    # exposed in the readable/raw product payload. If none exists, leave null.
-    description = find_first_text_by_keys(
-        detail,
-        (
-            "description",
-            "product_description",
-            "productDescription",
-            "description_text",
-            "desc",
-        ),
-    )
-
-    if description:
-        product["description"] = description
-        product["descriptionStatus"] = "AVAILABLE_MOBILE_API"
-    elif product.get("description"):
-        product["descriptionStatus"] = "AVAILABLE_SEARCH_PROVIDER"
-    else:
-        product["descriptionStatus"] = "NOT_AVAILABLE"
-
-
-async def enrich_products_with_mobile_details(
-    products: List[Dict[str, Any]],
-    max_products: int,
-    region: str,
-    detail_actor_id: str,
-    log,
-) -> None:
-    """
-    Enrich up to max_products using a mobile TikTok Shop product API Actor.
-    This avoids browser CAPTCHA / Security Check pages.
-    """
-    if max_products <= 0:
-        return
-
-    candidates = [
-        product
-        for product in products
-        if product.get("productId") or product.get("productUrl")
-    ][:max_products]
-
-    if not candidates:
-        log.info("[DETAIL] No products available for mobile detail enrichment.")
-        return
-
-    log.info(
-        f"[DETAIL] Enriching {len(candidates)} products with {detail_actor_id}."
-    )
-
-    for index, product in enumerate(candidates, start=1):
-        product_input = (
-            str(product.get("productId"))
-            if product.get("productId")
-            else str(product.get("productUrl"))
+    if baseline_7d is not None and baseline_14d is not None:
+        previous_7d_sales = safe_delta(
+            as_float(baseline_7d.get("soldCount")),
+            as_float(baseline_14d.get("soldCount")),
+            counter=True,
         )
 
-        run_input = {
-            "productInput": product_input,
-            "region": region.upper(),
-            "outputMode": "full_readable",
+    sales_growth_7d = safe_percent_change(sold7d, previous_7d_sales)
+
+    avg_daily_sales_7d = None
+    if sold7d is not None:
+        avg_daily_sales_7d = round(sold7d / 7.0, 2)
+
+    sales_velocity_ratio = None
+    if (
+        sold24h is not None
+        and avg_daily_sales_7d is not None
+        and avg_daily_sales_7d > 0
+    ):
+        sales_velocity_ratio = round(sold24h / avg_daily_sales_7d, 3)
+
+    trend = "UNKNOWN"
+
+    rising_signals = 0
+    falling_signals = 0
+    signal_count = 0
+
+    if sales_growth_7d is not None:
+        signal_count += 1
+        if sales_growth_7d >= 20:
+            rising_signals += 1
+        elif sales_growth_7d <= -20:
+            falling_signals += 1
+
+    if sales_velocity_ratio is not None:
+        signal_count += 1
+        if sales_velocity_ratio >= 1.25:
+            rising_signals += 1
+        elif sales_velocity_ratio <= 0.75:
+            falling_signals += 1
+
+    if signal_count > 0:
+        if rising_signals > falling_signals:
+            trend = "RISING"
+        elif falling_signals > rising_signals:
+            trend = "FALLING"
+        else:
+            trend = "STABLE"
+
+    previous_price_snapshot = latest_snapshot_with_value(history, "currentPrice")
+    previous_price = (
+        as_float(previous_price_snapshot.get("currentPrice"))
+        if previous_price_snapshot is not None
+        else None
+    )
+
+    current_price = as_float(product.get("currentPrice"))
+    price_change_percent = safe_percent_change(current_price, previous_price)
+
+    seven_days_ago = now - timedelta(days=7)
+    prices_7d: List[float] = []
+
+    for item in history:
+        dt = parse_datetime(item.get("timestamp"))
+        price = as_float(item.get("currentPrice"))
+
+        if dt is not None and dt >= seven_days_ago and price is not None:
+            prices_7d.append(price)
+
+    if current_price is not None:
+        prices_7d.append(current_price)
+
+    lowest_price_7d = round(min(prices_7d), 2) if prices_7d else None
+
+    reviews24h = calculate_counter_delta(product.get("reviewCount"), baseline_24h, "reviewCount")
+    review_growth_7d = calculate_counter_delta(product.get("reviewCount"), baseline_7d, "reviewCount")
+    review_growth_percent_7d = percent_growth_from_counts(
+        product.get("reviewCount"),
+        baseline_7d,
+        "reviewCount",
+    )
+
+    new_creators_7d = calculate_regular_delta(
+        product.get("creatorCount"),
+        baseline_7d,
+        "creatorCount",
+    )
+    creator_growth_7d = percent_growth_from_counts(
+        product.get("creatorCount"),
+        baseline_7d,
+        "creatorCount",
+    )
+
+    views7d = calculate_regular_delta(product.get("views"), baseline_7d, "views")
+    views_growth_7d = percent_growth_from_counts(
+        product.get("views"),
+        baseline_7d,
+        "views",
+    )
+
+    stock_change_24h = calculate_regular_delta(product.get("stock"), baseline_24h, "stock")
+    stock_change_7d = calculate_regular_delta(product.get("stock"), baseline_7d, "stock")
+
+    estimated_gmv_24h = None
+    estimated_gmv_7d = None
+
+    if current_price is not None:
+        if sold24h is not None:
+            estimated_gmv_24h = round(current_price * sold24h, 2)
+        if sold7d is not None:
+            estimated_gmv_7d = round(current_price * sold7d, 2)
+
+    observed_age_days = round(
+        max(0.0, (now - first_seen).total_seconds() / 86400.0),
+        2,
+    )
+
+    listed_at = parse_datetime(product.get("listedAt"))
+    product_age_days = None
+
+    if listed_at is not None:
+        product_age_days = round(
+            max(0.0, (now - listed_at).total_seconds() / 86400.0),
+            2,
+        )
+
+    return {
+        "snapshotAt": now.isoformat(),
+        "firstSeen": first_seen.isoformat(),
+        "observedAgeDays": observed_age_days,
+        "productAgeDays": product_age_days,
+        "ageSource": "provider_listed_at" if product_age_days is not None else "first_seen_only",
+
+        "historySnapshotCount": len(history),
+        "has24hBaseline": baseline_24h is not None,
+        "has7dBaseline": baseline_7d is not None,
+        "has14dBaseline": baseline_14d is not None,
+        "baseline24hAt": baseline_24h.get("timestamp") if baseline_24h else None,
+        "baseline7dAt": baseline_7d.get("timestamp") if baseline_7d else None,
+        "baseline14dAt": baseline_14d.get("timestamp") if baseline_14d else None,
+
+        "sold24h": round_or_none(sold24h, 0),
+        "sold7d": round_or_none(sold7d, 0),
+        "previous7dSales": round_or_none(previous_7d_sales, 0),
+        "avgDailySales7d": avg_daily_sales_7d,
+        "salesVelocityRatio": sales_velocity_ratio,
+        "salesGrowth7d": sales_growth_7d,
+        "trend": trend,
+
+        "previousPrice": round_or_none(previous_price, 2),
+        "lowestPrice7d": lowest_price_7d,
+        "priceChangePercent": price_change_percent,
+
+        "reviews24h": round_or_none(reviews24h, 0),
+        "reviewGrowth7d": round_or_none(review_growth_7d, 0),
+        "reviewGrowthPercent7d": review_growth_percent_7d,
+
+        "newCreators7d": round_or_none(new_creators_7d, 0),
+        "creatorGrowth7d": creator_growth_7d,
+
+        "views7d": round_or_none(views7d, 0),
+        "viewsGrowth7d": views_growth_7d,
+
+        "stockChange24h": round_or_none(stock_change_24h, 0),
+        "stockChange7d": round_or_none(stock_change_7d, 0),
+
+        "estimatedGMV24h": estimated_gmv_24h,
+        "estimatedGMV7d": estimated_gmv_7d,
+    }
+
+
+async def enrich_product_with_history(
+    product: Dict[str, Any],
+    *,
+    history_store,
+    now: datetime,
+    max_snapshots: int,
+    tolerance_hours: float,
+    log,
+) -> Dict[str, Any]:
+    identity = (
+        product.get("productId")
+        or product.get("productUrl")
+        or product.get("title")
+    )
+
+    if not identity:
+        product["historyError"] = "Product has no stable identity."
+        return product
+
+    state_key = f"product-{sha1_text(product.get('region', '') + ':' + str(identity))}"
+
+    try:
+        state = await history_store.get_value(state_key)
+
+        if not isinstance(state, dict):
+            state = {}
+
+        history = valid_history_items(state.get("history"))
+
+        first_seen = parse_datetime(state.get("firstSeen"))
+
+        if first_seen is None:
+            first_seen = now
+
+        metrics = compute_history_metrics(
+            product,
+            history=history,
+            first_seen=first_seen,
+            now=now,
+            tolerance_hours=tolerance_hours,
+        )
+
+        product.update(metrics)
+        product["historyStoreKey"] = state_key
+
+        current_snapshot = build_snapshot(product, now)
+
+        history.append(current_snapshot)
+
+        if max_snapshots > 0 and len(history) > max_snapshots:
+            history = history[-max_snapshots:]
+
+        new_state = {
+            "productId": product.get("productId"),
+            "productUrl": product.get("productUrl"),
+            "title": product.get("title"),
+            "region": product.get("region"),
+            "firstSeen": first_seen.isoformat(),
+            "lastSeen": now.isoformat(),
+            "history": history,
         }
 
-        try:
-            log.info(
-                f"[DETAIL] ({index}/{len(candidates)}) "
-                f"product={product_input}, region={region.upper()}"
-            )
+        await history_store.set_value(state_key, new_state)
 
-            run = await Actor.call(
-                actor_id=detail_actor_id,
-                run_input=run_input,
-            )
+        # Count includes the snapshot just saved.
+        product["historySnapshotCount"] = len(history)
 
-            if run is None:
-                product["detailStatus"] = "ERROR"
-                product["detailError"] = "Detail Actor failed to start."
-                continue
-
-            run_client = Actor.apify_client.run(run.id)
-            dataset_client = run_client.dataset()
-            page = await dataset_client.list_items(limit=1)
-            items = page.items or []
-
-            if not items or not isinstance(items[0], dict):
-                product["detailStatus"] = "NO_RESULT"
-                product["detailError"] = "Detail Actor returned no dataset item."
-                continue
-
-            merge_mobile_detail_into_product(
-                product=product,
-                raw=items[0],
-                detail_actor_id=detail_actor_id,
-            )
-
-            log.info(
-                f"[DETAIL] ({index}/{len(candidates)}) "
-                f"status={product.get('detailStatus')}, "
-                f"title={product.get('title')!r}"
-            )
-
-        except Exception as exc:
-            product["detailStatus"] = "ERROR"
-            product["detailError"] = f"{type(exc).__name__}: {exc}"
-            log.warning(
-                f"[DETAIL] Failed for {product_input}: {product['detailError']}"
-            )
-
-
-# ---------------------
-# Search result screenshot enrichment
-# ---------------------
-
-async def enrich_search_products_with_screenshots(
-    products: List[Dict[str, Any]],
-    max_screenshots: int,
-    proxy_configuration,
-    accept_language: str,
-    timeouts: Dict[str, Any],
-    kv_store: KeyValueStore,
-    log,
-    debug: bool = False,
-) -> None:
-    """
-    Attempt full-page screenshots for up to five search results.
-
-    Important:
-    - If TikTok returns a Security Check / CAPTCHA, we DO NOT store the blank
-      screenshot as a successful product screenshot.
-    - The result is marked SECURITY_CHECK and keeps the product image URL from
-      the search/mobile data as fallback visual evidence.
-    """
-    max_screenshots = max(0, min(5, int(max_screenshots)))
-
-    if max_screenshots <= 0:
-        return
-
-    candidates = [
-        product
-        for product in products
-        if product.get("productUrl")
-    ][:max_screenshots]
-
-    if not candidates:
-        log.info("[SCREENSHOT] No product URLs available.")
-        return
-
-    log.info(
-        f"[SCREENSHOT] Attempting {len(candidates)} full-page product screenshots."
-    )
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+    except Exception as exc:
+        product["historyError"] = f"{type(exc).__name__}: {exc}"
+        log.warning(
+            f"[HISTORY] Failed for {identity}: {product['historyError']}"
         )
 
-        try:
-            for index, product in enumerate(candidates, start=1):
-                url = str(product.get("productUrl") or "").strip()
-
-                if not url:
-                    continue
-
-                product["fallbackVisualUrl"] = (
-                    product.get("image")
-                    or (
-                        product.get("images")[0]
-                        if isinstance(product.get("images"), list)
-                        and product.get("images")
-                        else None
-                    )
-                )
-
-                proxy_url: Optional[str] = None
-
-                if proxy_configuration is not None:
-                    try:
-                        proxy_url = await proxy_configuration.new_url()
-                    except Exception as exc:
-                        log.warning(
-                            f"[SCREENSHOT] Proxy URL failed for {url}: {exc}"
-                        )
-
-                context: Optional[BrowserContext] = None
-                page: Optional[Page] = None
-                response: Optional[Response] = None
-
-                try:
-                    context = await create_context_for_req(
-                        browser=browser,
-                        accept_language=accept_language,
-                        proxy_url=proxy_url,
-                        use_mobile=True,
-                    )
-
-                    page = await context.new_page()
-
-                    log.info(
-                        f"[SCREENSHOT] ({index}/{len(candidates)}) Opening {url}"
-                    )
-
-                    response = await page.goto(
-                        url,
-                        timeout=timeouts.get(
-                            "navigation",
-                            DEFAULT_NAVIGATION_TIMEOUT_MS,
-                        ),
-                        wait_until="domcontentloaded",
-                    )
-
-                    await page.wait_for_timeout(2_000)
-
-                    try:
-                        page_title = await page.title()
-                    except Exception:
-                        page_title = None
-
-                    product["pageTitle"] = page_title
-                    product["screenshotHttpStatus"] = (
-                        response.status
-                        if response is not None
-                        else None
-                    )
-                    product["screenshotFinalUrl"] = page.url
-
-                    normalized_title = (page_title or "").strip().lower()
-
-                    challenge_markers = (
-                        "security check",
-                        "verify to continue",
-                        "verification",
-                        "captcha",
-                    )
-
-                    blocked = any(
-                        marker in normalized_title
-                        for marker in challenge_markers
-                    )
-
-                    if blocked:
-                        product["screenshotStatus"] = "SECURITY_CHECK"
-                        product["screenshotKey"] = None
-
-                        # Do not overwrite a good description collected from
-                        # the mobile detail Actor.
-                        if not product.get("description"):
-                            product["descriptionStatus"] = (
-                                "NOT_AVAILABLE_SECURITY_CHECK"
-                            )
-
-                        log.warning(
-                            f"[SCREENSHOT] Security Check for {url}; "
-                            f"blank screenshot was NOT stored."
-                        )
-
-                        if debug:
-                            try:
-                                html_key = stable_key(
-                                    "security-check-debug",
-                                    str(product.get("productId") or url),
-                                    "html",
-                                )
-
-                                await kv_store.set_value(
-                                    html_key,
-                                    await page.content(),
-                                    content_type="text/html",
-                                )
-
-                                product["debugHtmlKey"] = html_key
-                            except Exception as exc:
-                                log.warning(
-                                    f"[SCREENSHOT] Security debug HTML failed: {exc}"
-                                )
-
-                        continue
-
-                    # The real product page loaded. Try to extract description
-                    # directly from the page without inventing anything.
-                    page_description = (
-                        await get_meta_content(
-                            page,
-                            'meta[property="og:description"]',
-                        )
-                        or await get_meta_content(
-                            page,
-                            'meta[name="description"]',
-                        )
-                    )
-
-                    try:
-                        raw_json_ld = await page.locator(
-                            'script[type="application/ld+json"]'
-                        ).all_text_contents()
-                    except Exception:
-                        raw_json_ld = []
-
-                    structured = parse_json_ld_product(raw_json_ld)
-
-                    if not product.get("description"):
-                        product["description"] = (
-                            structured.get("description")
-                            or page_description
-                        )
-
-                    if product.get("description"):
-                        product["descriptionStatus"] = "AVAILABLE_PRODUCT_PAGE"
-                    elif not product.get("descriptionStatus"):
-                        product["descriptionStatus"] = "NOT_FOUND"
-
-                    screenshot_key = stable_key(
-                        "search-product",
-                        str(product.get("productId") or url),
-                        "png",
-                    )
-
-                    screenshot = await page.screenshot(full_page=True)
-
-                    await kv_store.set_value(
-                        screenshot_key,
-                        screenshot,
-                        content_type="image/png",
-                    )
-
-                    product["screenshotKey"] = screenshot_key
-                    product["screenshotStatus"] = "PRODUCT_PAGE"
-
-                    log.info(
-                        f"[SCREENSHOT] Saved real product page kv://{screenshot_key}"
-                    )
-
-                    if debug:
-                        try:
-                            html_key = stable_key(
-                                "search-product-debug",
-                                str(product.get("productId") or url),
-                                "html",
-                            )
-
-                            await kv_store.set_value(
-                                html_key,
-                                await page.content(),
-                                content_type="text/html",
-                            )
-
-                            product["debugHtmlKey"] = html_key
-                        except Exception as exc:
-                            log.warning(
-                                f"[SCREENSHOT] Debug HTML failed for {url}: {exc}"
-                            )
-
-                except Exception as exc:
-                    product["screenshotStatus"] = "ERROR"
-                    product["screenshotKey"] = None
-                    product["screenshotError"] = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-                    log.warning(
-                        f"[SCREENSHOT] Failed for {url}: "
-                        f"{product['screenshotError']}"
-                    )
-
-                finally:
-                    if page is not None:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-
-                    if context is not None:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
-
-        finally:
-            await browser.close()
+    return product
 
 
-# ---------------------
+# ---------------------------------------------------------------------------
+# Opportunity / top-product score
+# ---------------------------------------------------------------------------
+
+def percentile_scores(
+    products: List[Dict[str, Any]],
+    field: str,
+) -> Dict[int, float]:
+    values: List[Tuple[int, float]] = []
+
+    for index, product in enumerate(products):
+        value = as_float(product.get(field))
+        if value is not None:
+            values.append((index, value))
+
+    if not values:
+        return {}
+
+    sorted_values = sorted(value for _, value in values)
+    count = len(sorted_values)
+    result: Dict[int, float] = {}
+
+    for index, value in values:
+        # Fraction of available products at or below this value.
+        rank = sum(1 for candidate in sorted_values if candidate <= value)
+        result[index] = rank / count
+
+    return result
+
+
+def direct_ratio(value: Any, maximum: float) -> Optional[float]:
+    number = as_float(value)
+    if number is None or maximum <= 0:
+        return None
+    return max(0.0, min(1.0, number / maximum))
+
+
+def calculate_top_product_scores(products: List[Dict[str, Any]]) -> None:
+    percentile_fields = {
+        "sold7d": percentile_scores(products, "sold7d"),
+        "salesGrowth7d": percentile_scores(products, "salesGrowth7d"),
+        "sold24h": percentile_scores(products, "sold24h"),
+        "creatorGrowth7d": percentile_scores(products, "creatorGrowth7d"),
+        "views7d": percentile_scores(products, "views7d"),
+        "reviewGrowth7d": percentile_scores(products, "reviewGrowth7d"),
+        "soldCount": percentile_scores(products, "soldCount"),
+    }
+
+    # Total = 1.00
+    weights = {
+        "sold7d": 0.22,
+        "salesGrowth7d": 0.18,
+        "sold24h": 0.10,
+        "creatorGrowth7d": 0.12,
+        "views7d": 0.08,
+        "reviewGrowth7d": 0.08,
+        "commissionPercent": 0.08,
+        "rating": 0.05,
+        "discountPercent": 0.04,
+        "productAgeDays": 0.03,
+        "soldCount": 0.02,
+    }
+
+    for index, product in enumerate(products):
+        weighted_sum = 0.0
+        available_weight = 0.0
+        components: Dict[str, Optional[float]] = {}
+
+        def add_component(name: str, score: Optional[float]) -> None:
+            nonlocal weighted_sum, available_weight
+            components[name] = round(score * 100.0, 2) if score is not None else None
+
+            if score is None:
+                return
+
+            weight = weights[name]
+            weighted_sum += score * weight
+            available_weight += weight
+
+        add_component("sold7d", percentile_fields["sold7d"].get(index))
+        add_component("salesGrowth7d", percentile_fields["salesGrowth7d"].get(index))
+        add_component("sold24h", percentile_fields["sold24h"].get(index))
+        add_component("creatorGrowth7d", percentile_fields["creatorGrowth7d"].get(index))
+        add_component("views7d", percentile_fields["views7d"].get(index))
+        add_component("reviewGrowth7d", percentile_fields["reviewGrowth7d"].get(index))
+
+        add_component(
+            "commissionPercent",
+            direct_ratio(product.get("commissionPercent"), 20.0),
+        )
+        add_component(
+            "rating",
+            direct_ratio(product.get("rating"), 5.0),
+        )
+        add_component(
+            "discountPercent",
+            direct_ratio(product.get("discountPercent"), 50.0),
+        )
+
+        age = as_float(product.get("productAgeDays"))
+        if age is None:
+            newness_score = None
+        else:
+            newness_score = max(0.0, min(1.0, 1.0 - (age / 90.0)))
+
+        add_component("productAgeDays", newness_score)
+        add_component("soldCount", percentile_fields["soldCount"].get(index))
+
+        if available_weight > 0:
+            raw_score = (weighted_sum / available_weight) * 100.0
+            coverage = available_weight
+            # Confidence-adjust the score. A first run with little historical
+            # data cannot look as strong as a product with full 7/14-day data.
+            final_score = raw_score * math.sqrt(coverage)
+
+            product["rawOpportunityScore"] = round(raw_score, 2)
+            product["scoreCoveragePercent"] = round(coverage * 100.0, 2)
+            product["topProductScore"] = round(final_score, 2)
+        else:
+            product["rawOpportunityScore"] = None
+            product["scoreCoveragePercent"] = 0.0
+            product["topProductScore"] = None
+
+        product["scoreComponents"] = components
+
+
+# ---------------------------------------------------------------------------
+# Filtering / sorting
+# ---------------------------------------------------------------------------
+
+def metric_at_least(product: Dict[str, Any], field: str, minimum: float) -> bool:
+    if minimum <= 0:
+        return True
+
+    value = as_float(product.get(field))
+    return value is not None and value >= minimum
+
+
+def product_passes_filters(
+    product: Dict[str, Any],
+    *,
+    only_discounted: bool,
+    only_in_stock: bool,
+    min_discount: float,
+    min_sold_total: int,
+    min_sold_24h: int,
+    min_sold_7d: int,
+    min_rating: float,
+    min_commission: float,
+) -> bool:
+    if only_discounted:
+        discount = as_float(product.get("discountPercent"))
+        if discount is None or discount <= 0:
+            return False
+
+    if only_in_stock and product.get("inStock") is not True:
+        return False
+
+    if not metric_at_least(product, "discountPercent", min_discount):
+        return False
+
+    if not metric_at_least(product, "soldCount", min_sold_total):
+        return False
+
+    if not metric_at_least(product, "sold24h", min_sold_24h):
+        return False
+
+    if not metric_at_least(product, "sold7d", min_sold_7d):
+        return False
+
+    if not metric_at_least(product, "rating", min_rating):
+        return False
+
+    if not metric_at_least(product, "commissionPercent", min_commission):
+        return False
+
+    return True
+
+
+SORT_FIELD_MAP = {
+    "top_score": "topProductScore",
+    "sold24h": "sold24h",
+    "sold7d": "sold7d",
+    "sales_growth": "salesGrowth7d",
+    "creator_growth": "creatorGrowth7d",
+    "views7d": "views7d",
+    "review_growth": "reviewGrowth7d",
+    "commission": "commissionPercent",
+    "rating": "rating",
+    "discount": "discountPercent",
+    "sold_total": "soldCount",
+    "price": "currentPrice",
+}
+
+
+def sort_products(products: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
+    field = SORT_FIELD_MAP.get(sort_by, "topProductScore")
+
+    return sorted(
+        products,
+        key=lambda product: (
+            as_float(product.get(field))
+            if as_float(product.get(field)) is not None
+            else float("-inf"),
+            as_float(product.get("soldCount")) or 0.0,
+        ),
+        reverse=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
-# ---------------------
+# ---------------------------------------------------------------------------
 
 async def main() -> None:
     async with Actor:
         log = Actor.log
         input_data = await Actor.get_input() or {}
 
-        try:
-            log.info(
-                "Actor input: "
-                + json.dumps(
-                    input_data,
-                    ensure_ascii=False,
-                )
-            )
-        except Exception:
-            pass
+        region = str(input_data.get("region", "DE")).strip().upper() or "DE"
 
-        mode = str(
-            input_data.get("mode", "auto")
-        ).strip().lower()
-
-        if mode not in {"auto", "search", "product"}:
-            raise ValueError(
-                "mode must be one of: auto, search, product"
-            )
-
-        region = str(
-            input_data.get("region", "DE")
-        ).strip().upper() or "DE"
-
-        # ---------------------
-        # SEARCH MODE
-        # ---------------------
-
-        keywords = (
-            input_data.get("keywords")
-            or input_data.get("keyword")
-            or input_data.get("searchKeywords")
-            or []
+        search_actor_id = (
+            str(input_data.get("searchActorId", DEFAULT_SEARCH_ACTOR_ID)).strip()
+            or DEFAULT_SEARCH_ACTOR_ID
         )
+
+        keywords = input_data.get("keywords") or []
+        categories = input_data.get("tiktokCategories") or []
 
         if isinstance(keywords, str):
             keywords = [keywords]
 
-        tiktok_categories = (
-            input_data.get("tiktokCategories")
-            or []
-        )
+        if isinstance(categories, str):
+            categories = [categories]
 
         search_queries: List[str] = []
 
@@ -1955,503 +1312,230 @@ async def main() -> None:
             if value:
                 search_queries.append(value)
 
-        # Category labels become broad search terms for the search provider.
-        category_query_map = {
-            "beauty": "Beauty",
-            "fashion": "Fashion",
-            "electronics": "Elektronik",
-            "home": "Haushalt",
-            "pets": "Tierbedarf",
-            "sports": "Sport",
-            "food": "Lebensmittel",
-            "baby": "Baby",
-            "health": "Gesundheit",
-        }
-
-        for category in tiktok_categories:
-            raw_category = str(category).strip()
-            if not raw_category:
+        for category in categories:
+            value = str(category).strip()
+            if not value:
                 continue
-
             search_queries.append(
-                category_query_map.get(
-                    raw_category.lower(),
-                    raw_category,
-                )
+                CATEGORY_QUERY_MAP.get(value.lower(), value)
             )
 
-        # Deduplicate while preserving order.
         search_queries = list(dict.fromkeys(search_queries))
 
-        run_search = (
-            mode in {"auto", "search"}
-            and bool(search_queries)
-        )
-
-        search_actor_id = str(
-            input_data.get(
-                "searchActorId",
-                DEFAULT_SEARCH_ACTOR_ID,
+        if not search_queries:
+            raise ValueError(
+                "Add at least one keyword or TikTok category."
             )
-        ).strip() or DEFAULT_SEARCH_ACTOR_ID
 
-        max_items = max(
+        max_items = max(1, min(1000, int(input_data.get("maxItems", 100))))
+        max_output_products = max(
             1,
-            int(input_data.get("maxItems", 100)),
+            min(1000, int(input_data.get("maxOutputProducts", 100))),
         )
 
-        only_discounted = bool(
-            input_data.get("onlyDiscounted", False)
+        price_mode = str(input_data.get("priceMode", "auto")).strip().lower()
+        if price_mode not in {"auto", "raw", "minor_units"}:
+            raise ValueError("priceMode must be auto, raw, or minor_units.")
+
+        price_divisor = float(input_data.get("priceDivisor", 100) or 100)
+        auto_minor_threshold = float(
+            input_data.get("autoMinorUnitThreshold", 100) or 100
         )
 
-        min_discount = float(
-            input_data.get("minDiscount", 0) or 0
+        include_raw_provider_data = bool(
+            input_data.get("includeRawProviderData", False)
         )
 
-        min_sold = int(
-            input_data.get("minSold", 0) or 0
+        track_history = bool(input_data.get("trackHistory", True))
+        history_store_name = sanitize_store_name(
+            str(input_data.get("historyStoreName", DEFAULT_HISTORY_STORE))
+        )
+        max_snapshots = max(
+            10,
+            min(5000, int(input_data.get("maxSnapshotsPerProduct", 500))),
+        )
+        tolerance_hours = max(
+            1.0,
+            min(72.0, float(input_data.get("windowToleranceHours", 18) or 18)),
         )
 
-        min_rating = float(
-            input_data.get("minRating", 0) or 0
-        )
+        now = datetime.now(timezone.utc)
 
-        sort_by = str(
-            input_data.get("sortBy", "discount")
-        ).strip().lower()
-
+        all_products: List[Dict[str, Any]] = []
         search_errors: List[Dict[str, str]] = []
-        search_products: List[Dict[str, Any]] = []
 
-        if run_search:
-            for query in search_queries:
-                products, error = await call_search_provider(
-                    query=query,
-                    region=region,
-                    max_items=max_items,
-                    search_actor_id=search_actor_id,
+        for query in search_queries:
+            products, error = await call_search_provider(
+                query=query,
+                region=region,
+                max_items=max_items,
+                search_actor_id=search_actor_id,
+                price_mode=price_mode,
+                price_divisor=price_divisor,
+                auto_minor_threshold=auto_minor_threshold,
+                include_raw_provider_data=include_raw_provider_data,
+                log=log,
+            )
+
+            all_products.extend(products)
+
+            if error:
+                search_errors.append({"query": query, "error": error})
+
+        products = deduplicate_products(all_products)
+
+        history_store = None
+
+        if track_history:
+            history_store = await Actor.open_key_value_store(
+                name=history_store_name
+            )
+
+            for product in products:
+                await enrich_product_with_history(
+                    product,
+                    history_store=history_store,
+                    now=now,
+                    max_snapshots=max_snapshots,
+                    tolerance_hours=tolerance_hours,
                     log=log,
                 )
-
-                search_products.extend(products)
-
-                if error:
-                    search_errors.append(
-                        {
-                            "query": query,
-                            "error": error,
-                        }
-                    )
-
-            # Deduplicate by productId, otherwise URL, otherwise title.
-            deduped: Dict[str, Dict[str, Any]] = {}
-
-            for product in search_products:
-                identity = (
-                    product.get("productId")
-                    or product.get("productUrl")
-                    or product.get("title")
+        else:
+            for product in products:
+                product.update(
+                    {
+                        "snapshotAt": now.isoformat(),
+                        "firstSeen": None,
+                        "observedAgeDays": None,
+                        "productAgeDays": (
+                            round(
+                                max(
+                                    0.0,
+                                    (
+                                        now
+                                        - parse_datetime(product.get("listedAt"))
+                                    ).total_seconds()
+                                    / 86400.0,
+                                ),
+                                2,
+                            )
+                            if parse_datetime(product.get("listedAt")) is not None
+                            else None
+                        ),
+                        "ageSource": (
+                            "provider_listed_at"
+                            if parse_datetime(product.get("listedAt")) is not None
+                            else None
+                        ),
+                        "sold24h": None,
+                        "sold7d": None,
+                        "avgDailySales7d": None,
+                        "salesGrowth7d": None,
+                        "trend": "UNKNOWN",
+                        "previousPrice": None,
+                        "lowestPrice7d": product.get("currentPrice"),
+                        "priceChangePercent": None,
+                        "reviews24h": None,
+                        "reviewGrowth7d": None,
+                        "creatorGrowth7d": None,
+                        "newCreators7d": None,
+                        "views7d": None,
+                        "viewsGrowth7d": None,
+                        "stockChange24h": None,
+                        "stockChange7d": None,
+                    }
                 )
 
-                if not identity:
-                    continue
+        calculate_top_product_scores(products)
 
-                deduped[str(identity)] = product
+        only_discounted = bool(input_data.get("onlyDiscounted", False))
+        only_in_stock = bool(input_data.get("onlyInStock", False))
 
-            filtered_products = [
-                product
-                for product in deduped.values()
-                if product_passes_filters(
-                    product=product,
-                    only_discounted=only_discounted,
-                    min_discount=min_discount,
-                    min_sold=min_sold,
-                    min_rating=min_rating,
-                )
-            ]
+        min_discount = float(input_data.get("minDiscount", 0) or 0)
+        min_sold_total = int(input_data.get("minSoldTotal", 0) or 0)
+        min_sold_24h = int(input_data.get("minSold24h", 0) or 0)
+        min_sold_7d = int(input_data.get("minSold7d", 0) or 0)
+        min_rating = float(input_data.get("minRating", 0) or 0)
+        min_commission = float(input_data.get("minCommissionPercent", 0) or 0)
 
-            filtered_products = sort_products(
-                filtered_products,
-                sort_by=sort_by,
+        filtered_products = [
+            product
+            for product in products
+            if product_passes_filters(
+                product,
+                only_discounted=only_discounted,
+                only_in_stock=only_in_stock,
+                min_discount=min_discount,
+                min_sold_total=min_sold_total,
+                min_sold_24h=min_sold_24h,
+                min_sold_7d=min_sold_7d,
+                min_rating=min_rating,
+                min_commission=min_commission,
             )
+        ]
 
-            enrich_search_details = bool(
-                input_data.get(
-                    "enrichSearchDetails",
-                    True,
-                )
-            )
+        sort_by = str(input_data.get("sortBy", "top_score")).strip().lower()
 
-            max_detail_products = max(
-                0,
-                min(
-                    5,
-                    int(
-                        input_data.get(
-                            "maxDetailProducts",
-                            5,
-                        )
-                    ),
-                ),
-            )
+        sorted_products = sort_products(filtered_products, sort_by)
+        output_products = sorted_products[:max_output_products]
 
-            detail_actor_id = str(
-                input_data.get(
-                    "detailActorId",
-                    DEFAULT_DETAIL_ACTOR_ID,
-                )
-            ).strip() or DEFAULT_DETAIL_ACTOR_ID
+        for rank, product in enumerate(output_products, start=1):
+            product["rank"] = rank
 
-            if enrich_search_details and filtered_products:
-                await enrich_products_with_mobile_details(
-                    products=filtered_products,
-                    max_products=max_detail_products,
-                    region=region,
-                    detail_actor_id=detail_actor_id,
-                    log=log,
-                )
+        if output_products:
+            await Actor.push_data(output_products)
 
-            capture_search_screenshots = bool(
-                input_data.get(
-                    "captureSearchScreenshots",
-                    False,
-                )
-            )
+        summary = {
+            "version": "5.0-data",
+            "runAt": now.isoformat(),
+            "region": region,
+            "queries": search_queries,
+            "searchActorId": search_actor_id,
+            "productsReceived": len(all_products),
+            "uniqueProductsTracked": len(products),
+            "productsAfterFilters": len(filtered_products),
+            "productsOutput": len(output_products),
+            "sortBy": sort_by,
+            "trackHistory": track_history,
+            "historyStoreName": history_store_name if track_history else None,
+            "priceMode": price_mode,
+            "priceDivisor": price_divisor,
+            "autoMinorUnitThreshold": auto_minor_threshold,
+            "filters": {
+                "onlyDiscounted": only_discounted,
+                "onlyInStock": only_in_stock,
+                "minDiscount": min_discount,
+                "minSoldTotal": min_sold_total,
+                "minSold24h": min_sold_24h,
+                "minSold7d": min_sold_7d,
+                "minRating": min_rating,
+                "minCommissionPercent": min_commission,
+            },
+            "historicalMetrics": {
+                "sold24h": "Requires a suitable ~24h baseline.",
+                "sold7d": "Requires a suitable ~7d baseline.",
+                "salesGrowth7d": "Requires ~7d and ~14d baselines.",
+                "previousPrice": "Available after at least one earlier snapshot with price.",
+                "lowestPrice7d": "Calculated from stored price snapshots in the last 7 days.",
+                "creatorGrowth7d": "Requires creatorCount from provider plus a ~7d baseline.",
+                "views7d": "Requires views from provider plus a ~7d baseline.",
+                "stockChange7d": "Requires stock from provider plus a ~7d baseline.",
+            },
+            "errors": search_errors,
+        }
 
-            max_search_screenshots = max(
-                0,
-                min(
-                    5,
-                    int(
-                        input_data.get(
-                            "maxSearchScreenshots",
-                            5,
-                        )
-                    ),
-                ),
-            )
-
-            if capture_search_screenshots and filtered_products:
-                accept_language_for_search = input_data.get(
-                    "acceptLanguage",
-                    "de-DE,de;q=0.9,en;q=0.8",
-                )
-
-                screenshot_timeouts = ms_timeouts_from_input(
-                    input_data.get("timeouts", {})
-                )
-
-                screenshot_debug = bool(
-                    input_data.get(
-                        "debug",
-                        False,
-                    )
-                )
-
-                screenshot_proxy_configuration = (
-                    await Actor.create_proxy_configuration(
-                        actor_proxy_input=input_data.get(
-                            "proxyConfiguration"
-                        )
-                    )
-                )
-
-                screenshot_kv_store = await KeyValueStore.open()
-
-                await enrich_search_products_with_screenshots(
-                    products=filtered_products,
-                    max_screenshots=max_search_screenshots,
-                    proxy_configuration=screenshot_proxy_configuration,
-                    accept_language=accept_language_for_search,
-                    timeouts=screenshot_timeouts,
-                    kv_store=screenshot_kv_store,
-                    log=log,
-                    debug=screenshot_debug,
-                )
-
-            if filtered_products:
-                await Actor.push_data(
-                    filtered_products
-                )
-
-            await Actor.set_value(
-                "SEARCH_SUMMARY",
-                {
-                    "mode": mode,
-                    "region": region,
-                    "queries": search_queries,
-                    "searchActorId": search_actor_id,
-                    "productsReceived": len(search_products),
-                    "uniqueProducts": len(deduped),
-                    "productsSaved": len(filtered_products),
-                    "enrichSearchDetails": enrich_search_details,
-                    "maxDetailProducts": max_detail_products,
-                    "detailActorId": detail_actor_id,
-                    "captureSearchScreenshots": capture_search_screenshots,
-                    "maxSearchScreenshots": max_search_screenshots,
-                    "screenshotsAttempted": (
-                        min(
-                            max_search_screenshots,
-                            len(filtered_products),
-                        )
-                        if capture_search_screenshots
-                        else 0
-                    ),
-                    "filters": {
-                        "onlyDiscounted": only_discounted,
-                        "minDiscount": min_discount,
-                        "minSold": min_sold,
-                        "minRating": min_rating,
-                        "sortBy": sort_by,
-                    },
-                    "errors": search_errors,
-                },
-            )
-
-            log.info(
-                f"[SEARCH] Finished: "
-                f"received={len(search_products)}, "
-                f"unique={len(deduped)}, "
-                f"saved={len(filtered_products)}"
-            )
-
-        # In explicit search mode, do not launch Playwright at all.
-        if mode == "search":
-            return
-
-        # ---------------------
-        # PRODUCT / DIRECT MODE
-        # ---------------------
-
-        raw_start = (
-            input_data.get("startUrls")
-            or input_data.get("start_urls")
-            or input_data.get("productUrls")
-            or []
-        )
-
-        start_items = normalize_start_items(
-            raw_start
-        )
-
-        # Seller and manual category URLs remain best-effort Playwright discovery.
-        seller_handles = (
-            input_data.get("sellerHandles")
-            or []
-        )
-
-        if isinstance(seller_handles, str):
-            seller_handles = [seller_handles]
-
-        for handle in seller_handles:
-            clean_handle = str(handle).strip().lstrip("@")
-            if not clean_handle:
-                continue
-
-            start_items.append(
-                {
-                    "url": (
-                        "https://www.tiktok.com/"
-                        f"@{clean_handle}"
-                    ),
-                    "userData": {
-                        "label": LISTING_LABEL,
-                    },
-                }
-            )
-
-        category_urls = (
-            input_data.get("categoryUrls")
-            or []
-        )
-
-        for url in category_urls:
-            if not url:
-                continue
-
-            start_items.append(
-                {
-                    "url": str(url),
-                    "userData": {
-                        "label": LISTING_LABEL,
-                    },
-                }
-            )
-
-        # In auto mode, categories/keywords are handled by the search provider,
-        # so we deliberately do not turn them into TikTok /tag/ pages.
-        if not start_items:
-            if run_search:
-                log.info(
-                    "[AUTO] Search completed and there are no direct "
-                    "product/listing URLs to process."
-                )
-                return
-
-            log.warning(
-                "No direct product URLs, seller handles, "
-                "or category URLs were provided."
-            )
-            return
-
-        timeouts = ms_timeouts_from_input(
-            input_data.get("timeouts", {})
-        )
-
-        accept_language = input_data.get(
-            "acceptLanguage",
-            "de-DE,de;q=0.9,en;q=0.8",
-        )
-
-        capture_screenshots = bool(
-            input_data.get(
-                "captureScreenshots",
-                False,
-            )
-        )
-
-        debug = bool(
-            input_data.get(
-                "debug",
-                False,
-            )
-        )
-
-        fallback_enabled = bool(
-            input_data.get(
-                "fallbackEnabled",
-                True,
-            )
-        )
-
-        fallback_actor_id = str(
-            input_data.get(
-                "fallbackActorId",
-                DEFAULT_FALLBACK_ACTOR_ID,
-            )
-        ).strip() or DEFAULT_FALLBACK_ACTOR_ID
-
-        include_creator_videos = bool(
-            input_data.get(
-                "includeCreatorVideos",
-                False,
-            )
-        )
-
-        deep_creator_videos = bool(
-            input_data.get(
-                "deepCreatorVideos",
-                False,
-            )
-        )
-
-        proxy_configuration = (
-            await Actor.create_proxy_configuration(
-                actor_proxy_input=input_data.get(
-                    "proxyConfiguration"
-                )
-            )
-        )
-
-        kv_store = await KeyValueStore.open()
-        request_queue = (
-            await Actor.open_request_queue()
-        )
-
-        added = 0
-
-        for item in start_items:
-            url = item.get("url")
-            user_data = (
-                item.get("userData", {})
-                or {}
-            )
-
-            if not url:
-                continue
-
-            if not user_data.get("label"):
-                user_data = choose_label_for_url(
-                    url,
-                    user_data,
-                )
-
-            label = (
-                user_data.get("label")
-                or PRODUCT_LABEL
-            )
-
-            await request_queue.add_request(
-                Request.from_url(
-                    url,
-                    label=label,
-                )
-            )
-
-            added += 1
-
-            log.info(
-                f"Queued start URL: {url} "
-                f"(label={label})"
-            )
+        await Actor.set_value("SEARCH_SUMMARY", summary)
 
         log.info(
-            f"Added {added} direct requests."
+            "[DONE] "
+            f"received={len(all_products)} "
+            f"unique={len(products)} "
+            f"output={len(output_products)} "
+            f"history={track_history}"
         )
-
-        if added == 0:
-            return
-
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-
-            worker_count = max(
-                1,
-                int(
-                    input_data.get(
-                        "maxConcurrency",
-                        input_data.get(
-                            "concurrency",
-                            1,
-                        ),
-                    )
-                ),
-            )
-
-            workers = [
-                worker_loop(
-                    worker_id=index,
-                    browser=browser,
-                    request_queue=request_queue,
-                    proxy_configuration=proxy_configuration,
-                    accept_language=accept_language,
-                    region=region,
-                    timeouts=timeouts,
-                    capture_screenshots=capture_screenshots,
-                    kv_store=kv_store,
-                    log=log,
-                    debug=debug,
-                    fallback_enabled=fallback_enabled,
-                    fallback_actor_id=fallback_actor_id,
-                    include_creator_videos=include_creator_videos,
-                    deep_creator_videos=deep_creator_videos,
-                )
-                for index in range(
-                    worker_count
-                )
-            ]
-
-            await asyncio.gather(*workers)
-            await browser.close()
-
-        log.info("Run finished.")
 
 
 if __name__ == "__main__":
+    import asyncio
+
     asyncio.run(main())
