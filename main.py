@@ -494,7 +494,7 @@ async def process_product_task(
         final_url = page.url
         status = response.status if response else None
 
-                try:
+    try:
             page_title = await page.title()
         except Exception:
             page_title = None
