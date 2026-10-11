@@ -82,6 +82,7 @@
     "sortBy": {
       "title": "Sort results by",
       "type": "string",
+      "description": "Choose how the final product results should be sorted.",
       "editor": "select",
       "enum": [
         "discount",
