@@ -529,17 +529,16 @@ async def call_product_fallback(
         )
 
         run = await Actor.call(
-            fallback_actor_id,
+            actor_id=fallback_actor_id,
             run_input=fallback_input,
-            max_items=1,
         )
 
-        if run is None or not run.default_dataset_id:
-            return None, "Fallback Actor finished without a dataset."
+        if run is None:
+            return None, "Fallback Actor failed to start."
 
-        page = await Actor.apify_client.dataset(
-            run.default_dataset_id
-        ).list_items(limit=1)
+        run_client = Actor.apify_client.run(run.id)
+        dataset_client = run_client.dataset()
+        page = await dataset_client.list_items(limit=1)
 
         items = page.items or []
 
