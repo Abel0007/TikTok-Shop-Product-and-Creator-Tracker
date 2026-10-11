@@ -93,23 +93,62 @@ def ms_timeouts_from_input(raw_timeouts: Dict[str, Any]) -> Dict[str, int]:
     if not isinstance(raw_timeouts, dict):
         out["navigation"] = DEFAULT_NAVIGATION_TIMEOUT_MS
         return out
+
     if "navigation" in raw_timeouts:
         out["navigation"] = int(raw_timeouts["navigation"])
     elif "navigationTimeoutSecs" in raw_timeouts:
         out["navigation"] = int(raw_timeouts["navigationTimeoutSecs"]) * 1000
     else:
         out["navigation"] = DEFAULT_NAVIGATION_TIMEOUT_MS
+
     return out
 
 
-async def create_context_for_req(browser: Browser, accept_language: str, proxy_url: Optional[str] = None, use_mobile: bool = True):
+def to_playwright_proxy(proxy_url: str):
+    if not proxy_url:
+        return None
+
+    parsed = urllib.parse.urlparse(proxy_url)
+
+    server = f"{parsed.scheme}://{parsed.hostname}"
+
+    if parsed.port:
+        server += f":{parsed.port}"
+
+    proxy = {
+        "server": server,
+    }
+
+    if parsed.username:
+        proxy["username"] = urllib.parse.unquote(parsed.username)
+
+    if parsed.password:
+        proxy["password"] = urllib.parse.unquote(parsed.password)
+
+    return proxy
+
+
+async def create_context_for_req(
+    browser: Browser,
+    accept_language: str,
+    proxy_url: Optional[str] = None,
+    use_mobile: bool = True,
+):
+    locale = (accept_language or "de-DE").split(",")[0].strip()
+
     context_kwargs = {
         "user_agent": MOBILE_UA if use_mobile else DESKTOP_UA,
-        "locale": accept_language or "en-US",
+        "locale": locale,
         "java_script_enabled": True,
+        "extra_http_headers": {
+            "Accept-Language": accept_language
+            or "de-DE,de;q=0.9,en;q=0.8"
+        },
     }
+
     if proxy_url:
-        context_kwargs["proxy"] = {"server": proxy_url}
+        context_kwargs["proxy"] = to_playwright_proxy(proxy_url)
+
     return await browser.new_context(**context_kwargs)
 
 
