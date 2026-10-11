@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from apify import Actor, ProxyConfiguration
+from crawlee import Request
 from apify.storages import KeyValueStore
 from playwright.async_api import async_playwright, Browser, Page, Response
 
