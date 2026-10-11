@@ -285,7 +285,12 @@ async def process_product_task(
 
         unique = list(dict.fromkeys(product_candidates))
         for candidate in unique:
-            await request_queue.add_request({"url": candidate, "userData": {"label": PRODUCT_LABEL}})
+            await request_queue.add_request(
+    Request.from_url(
+        candidate,
+        label=PRODUCT_LABEL,
+    )
+)
             discovered += 1
             log.info(f"[LISTING] queued: {candidate}")
 
