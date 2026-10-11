@@ -151,7 +151,7 @@
       "type": "number",
       "description": "Divisor used for minor-unit prices. Use 100 for cents.",
       "default": 100,
-      "exclusiveMinimum": 0
+      "exclusiveMinimum": 1
     },
     "autoMinorUnitThreshold": {
       "title": "Auto minor-unit threshold",
