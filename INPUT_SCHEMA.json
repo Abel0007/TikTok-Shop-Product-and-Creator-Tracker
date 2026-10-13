@@ -1,20 +1,54 @@
 {
-  "title": "TikTok Shop Top Product Tracker — Data v5",
-  "description": "Search TikTok Shop products, persist snapshots across runs, calculate sales velocity, 24h/7d sales, price history, review growth, creator growth, views, commission, stock changes, trend, and a confidence-adjusted top-product score.",
+  "title": "TikTok Shop Top Product Intelligence v6",
+  "description": "Advanced multi-source TikTok Shop product intelligence with recent sales windows, commission, optional creator/video enrichment, persistent history, data-quality diagnostics and confidence-adjusted opportunity scoring.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "searchActorId": {
-      "title": "Search provider Actor",
+    "region": {
+      "title": "Region",
       "type": "string",
-      "description": "Apify Actor used to search TikTok Shop products.",
-      "default": "getanyapi/tiktok-shop-scraper",
-      "editor": "textfield"
+      "description": "TikTok Shop market. Germany is recommended for the current DE workflow.",
+      "editor": "select",
+      "enum": [
+        "DE",
+        "US",
+        "GB",
+        "ID",
+        "TH",
+        "VN",
+        "PH",
+        "MY",
+        "SG",
+        "JP",
+        "MX",
+        "IT",
+        "FR",
+        "ES",
+        "BR"
+      ],
+      "enumTitles": [
+        "Germany",
+        "United States",
+        "United Kingdom",
+        "Indonesia",
+        "Thailand",
+        "Vietnam",
+        "Philippines",
+        "Malaysia",
+        "Singapore",
+        "Japan",
+        "Mexico",
+        "Italy",
+        "France",
+        "Spain",
+        "Brazil"
+      ],
+      "default": "DE"
     },
     "keywords": {
       "title": "Keywords",
       "type": "array",
-      "description": "One or more TikTok Shop search terms, for example Beauty, Airfryer, Saugroboter, or Kosmetik.",
+      "description": "Product search terms such as Beauty, Airfryer, Saugroboter, Parfum or Skincare.",
       "editor": "stringList",
       "items": {
         "type": "string"
@@ -23,116 +57,161 @@
         "Beauty"
       ]
     },
-    "tiktokCategories": {
-      "title": "TikTok categories",
+    "categories": {
+      "title": "Market-intelligence categories",
       "type": "array",
-      "description": "Optional broad categories that are converted into search queries.",
-      "editor": "select",
+      "description": "Optional TikTok Shop category names. Leave empty for a keyword-only test.",
+      "editor": "stringList",
       "items": {
-        "type": "string",
-        "enum": [
-          "beauty",
-          "fashion",
-          "electronics",
-          "home",
-          "pets",
-          "sports",
-          "food",
-          "baby",
-          "health"
-        ],
-        "enumTitles": [
-          "Beauty & Personal Care",
-          "Fashion & Accessories",
-          "Electronics & Gadgets",
-          "Home & Living",
-          "Pet Supplies",
-          "Sports & Outdoors",
-          "Food & Beverages",
-          "Baby & Kids",
-          "Health & Wellness"
-        ]
+        "type": "string"
       },
       "default": []
     },
-    "region": {
-      "title": "Region",
-      "type": "string",
-      "description": "TikTok Shop market passed to the search provider.",
-      "editor": "select",
-      "enum": [
-        "US",
-        "GB",
-        "DE",
-        "SG",
-        "MY",
-        "TH",
-        "VN",
-        "PH",
-        "ID"
-      ],
-      "enumTitles": [
-        "United States",
-        "United Kingdom",
-        "Germany",
-        "Singapore",
-        "Malaysia",
-        "Thailand",
-        "Vietnam",
-        "Philippines",
-        "Indonesia"
-      ],
-      "default": "DE"
+    "marketOverallTop": {
+      "title": "Use overall market top list",
+      "type": "boolean",
+      "description": "Request the overall top products for the selected country instead of limiting market intelligence to the entered keywords/categories.",
+      "default": false
     },
-    "maxItems": {
-      "title": "Max products per query",
+    "searchActorId": {
+      "title": "Base search Actor",
+      "type": "string",
+      "description": "Actor used for local price, cumulative sold count, rating, shop, image and product URL.",
+      "default": "getanyapi/tiktok-shop-scraper",
+      "editor": "textfield"
+    },
+    "marketActorId": {
+      "title": "Market intelligence Actor",
+      "type": "string",
+      "description": "Actor used for last-day and last-7-day units sold, revenue growth, commission and launch-date data.",
+      "default": "lergassy/tiktok-shop-top-products-scraper",
+      "editor": "textfield"
+    },
+    "creatorsActorId": {
+      "title": "Creator intelligence Actor",
+      "type": "string",
+      "description": "Optional Actor used to find creators selling selected products and aggregate creator metrics.",
+      "default": "lergassy/tiktok-shop-creators-scraper",
+      "editor": "textfield"
+    },
+    "videosActorId": {
+      "title": "Video intelligence Actor",
+      "type": "string",
+      "description": "Optional Actor used to find shoppable product videos and aggregate views and engagement.",
+      "default": "lergassy/tiktok-shop-videos-scraper",
+      "editor": "textfield"
+    },
+    "maxSearchItemsPerQuery": {
+      "title": "Max base-search products per query",
       "type": "integer",
-      "description": "Maximum products requested from the search provider for each keyword/category.",
+      "description": "Maximum products requested from the base search source for each keyword.",
       "default": 100,
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "maxMarketItemsPerSource": {
+      "title": "Max market-intelligence products per source",
+      "type": "integer",
+      "description": "Maximum market-intelligence rows requested for each keyword/category in each time window.",
+      "default": 50,
       "minimum": 1,
       "maximum": 1000
     },
     "maxOutputProducts": {
-      "title": "Max products in output",
+      "title": "Max products in final output",
       "type": "integer",
-      "description": "Maximum ranked products written to the final Dataset. All discovered products can still be tracked in history before this output limit is applied.",
+      "description": "Maximum ranked products written to the final Dataset.",
       "default": 100,
       "minimum": 1,
       "maximum": 1000
     },
-    "trackHistory": {
-      "title": "Track history",
+    "enableMarketIntelligence": {
+      "title": "Enable recent market intelligence",
       "type": "boolean",
-      "description": "Persist product snapshots between runs so sold24h, sold7d, price history, trend, creator growth, review growth, views growth, and stock changes can be calculated.",
+      "description": "Fetch last-day and last-7-day market metrics for recent units sold, revenue growth and commission when available.",
+      "default": true
+    },
+    "includeMarketOnlyProducts": {
+      "title": "Include products found only by market intelligence",
+      "type": "boolean",
+      "description": "Add strong market-intelligence products even when the base search did not return them.",
+      "default": true
+    },
+    "enableMarketPaidAnalytics": {
+      "title": "Enable paid product analytics",
+      "type": "boolean",
+      "description": "Request optional creator count, video count, review count, price range and other provider analytics. This can increase cost and availability depends on the provider.",
+      "default": false
+    },
+    "enableCreatorEnrichment": {
+      "title": "Enable creator enrichment",
+      "type": "boolean",
+      "description": "For the strongest products, fetch creators selling them and calculate observed creator count, creator revenue, units and content views for the last 7 days.",
+      "default": false
+    },
+    "enableVideoEnrichment": {
+      "title": "Enable video enrichment",
+      "type": "boolean",
+      "description": "For the strongest products, fetch shoppable videos and calculate video count, views, likes, comments, shares, engagement and video revenue for the last 7 days.",
+      "default": false
+    },
+    "maxEnrichmentProducts": {
+      "title": "Max products for creator/video enrichment",
+      "type": "integer",
+      "description": "Only this many strongest products are sent to optional creator/video enrichment. Keep small for testing and cost control.",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 100
+    },
+    "maxCreatorsPerProduct": {
+      "title": "Max creators per product",
+      "type": "integer",
+      "description": "Maximum creator rows requested per enriched product.",
+      "default": 20,
+      "minimum": 1,
+      "maximum": 100
+    },
+    "maxVideosPerProduct": {
+      "title": "Max videos per product",
+      "type": "integer",
+      "description": "Maximum video rows requested per enriched product.",
+      "default": 20,
+      "minimum": 1,
+      "maximum": 100
+    },
+    "trackHistory": {
+      "title": "Track own history",
+      "type": "boolean",
+      "description": "Persist snapshots across runs for independent price history, sales deltas, creator/review growth and stock changes.",
       "default": true
     },
     "historyStoreName": {
       "title": "History Key-value store",
       "type": "string",
-      "description": "Named persistent Key-value store used for product history across Actor runs.",
-      "default": "tiktok-shop-top-products-history",
+      "description": "Persistent named Key-value store used for product history across Actor runs.",
+      "default": "tiktok-shop-top-products-v6-history",
       "editor": "textfield"
     },
     "maxSnapshotsPerProduct": {
       "title": "Max snapshots per product",
       "type": "integer",
-      "description": "Maximum historical snapshots retained for each product.",
+      "description": "Maximum own historical snapshots retained for each product.",
       "default": 500,
       "minimum": 10,
       "maximum": 5000
     },
     "windowToleranceHours": {
-      "title": "Historical baseline tolerance (hours)",
+      "title": "History baseline tolerance (hours)",
       "type": "number",
-      "description": "Maximum time difference allowed when selecting the nearest historical snapshot for 24h, 7d, and 14d metrics. 18 hours works well for roughly daily runs.",
+      "description": "Maximum time difference allowed when matching own snapshots to 24-hour, 7-day and 14-day baselines.",
       "default": 18,
       "minimum": 1,
       "maximum": 72
     },
     "priceMode": {
-      "title": "Price normalization",
+      "title": "Base price normalization",
       "type": "string",
-      "description": "auto keeps small integer prices as major currency units and divides large integer-like values by priceDivisor; raw never divides; minor_units always divides.",
+      "description": "Auto interprets large integer-like base-search prices as minor units; raw never divides; minor_units always divides by Price divisor.",
       "editor": "select",
       "enum": [
         "auto",
@@ -140,42 +219,42 @@
         "minor_units"
       ],
       "enumTitles": [
-        "Auto (recommended)",
+        "Auto",
         "Raw provider value",
-        "Always minor units / divisor"
+        "Always minor units"
       ],
       "default": "auto"
     },
     "priceDivisor": {
       "title": "Price divisor",
       "type": "number",
-      "description": "Divisor used for minor-unit prices. Use 100 for cents.",
+      "description": "Divisor used for minor-unit prices. Use 100 for euro cents.",
       "default": 100,
       "minimum": 1
     },
     "autoMinorUnitThreshold": {
       "title": "Auto minor-unit threshold",
       "type": "number",
-      "description": "In auto price mode, integer-like raw prices at or above this value are divided by priceDivisor. Default 100 handles values such as 861 -> 8.61 while keeping 19 -> 19.00.",
+      "description": "In auto mode, integer-like raw prices at or above this value are divided by Price divisor.",
       "default": 100,
       "minimum": 1
     },
     "onlyDiscounted": {
-      "title": "Only discounted",
+      "title": "Only discounted products",
       "type": "boolean",
-      "description": "Keep only products with a positive discountPercent.",
+      "description": "Keep only products with a positive discount percentage.",
       "default": false
     },
     "onlyInStock": {
-      "title": "Only in stock",
+      "title": "Only in-stock products",
       "type": "boolean",
-      "description": "Keep only products whose provider explicitly exposes inStock=true or a positive stock quantity.",
+      "description": "Keep only products for which a source explicitly exposes inStock=true.",
       "default": false
     },
     "minDiscount": {
       "title": "Minimum discount %",
       "type": "number",
-      "description": "Minimum discountPercent required in final output.",
+      "description": "Minimum discount percentage required in final output.",
       "default": 0,
       "minimum": 0,
       "maximum": 100
@@ -183,21 +262,21 @@
     "minSoldTotal": {
       "title": "Minimum total sold",
       "type": "integer",
-      "description": "Minimum provider-reported cumulative soldCount.",
+      "description": "Minimum cumulative soldCount from the base search source.",
       "default": 0,
       "minimum": 0
     },
     "minSold24h": {
-      "title": "Minimum sold in 24h",
+      "title": "Minimum sold 24h",
       "type": "integer",
-      "description": "Minimum sold24h required. Leave at 0 until enough history has been collected.",
+      "description": "Minimum recent units sold in the last day. Zero disables this filter.",
       "default": 0,
       "minimum": 0
     },
     "minSold7d": {
-      "title": "Minimum sold in 7d",
+      "title": "Minimum sold 7d",
       "type": "integer",
-      "description": "Minimum sold7d required. Leave at 0 until at least about 7 days of snapshots exist.",
+      "description": "Minimum recent units sold in the last 7 days. Zero disables this filter.",
       "default": 0,
       "minimum": 0
     },
@@ -212,7 +291,29 @@
     "minCommissionPercent": {
       "title": "Minimum commission %",
       "type": "number",
-      "description": "Minimum affiliate commission required when commissionPercent is provided by the source.",
+      "description": "Minimum affiliate commission percentage required when commission data is available.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 100
+    },
+    "minCreatorCount": {
+      "title": "Minimum creator count",
+      "type": "integer",
+      "description": "Minimum creator count required. Zero disables this filter.",
+      "default": 0,
+      "minimum": 0
+    },
+    "minVideoViews7d": {
+      "title": "Minimum video views 7d",
+      "type": "integer",
+      "description": "Minimum aggregated shoppable-video views in the 7-day enrichment window. Zero disables this filter.",
+      "default": 0,
+      "minimum": 0
+    },
+    "minTopProductScore": {
+      "title": "Minimum top-product score",
+      "type": "number",
+      "description": "Minimum confidence-adjusted opportunity score required. Keep zero during initial testing.",
       "default": 0,
       "minimum": 0,
       "maximum": 100
@@ -220,16 +321,18 @@
     "sortBy": {
       "title": "Sort results by",
       "type": "string",
-      "description": "Metric used to rank the final output.",
+      "description": "Metric used for final product ranking.",
       "editor": "select",
       "enum": [
         "top_score",
         "sold24h",
         "sold7d",
-        "sales_growth",
+        "sales_velocity",
+        "revenue_growth",
+        "creator_count",
         "creator_growth",
         "views7d",
-        "review_growth",
+        "engagement",
         "commission",
         "rating",
         "discount",
@@ -240,10 +343,12 @@
         "Top product score",
         "Sold 24h",
         "Sold 7d",
-        "Sales growth 7d",
+        "Sales velocity",
+        "Revenue growth 7d",
+        "Creator count",
         "Creator growth 7d",
-        "Views growth 7d",
-        "Review growth 7d",
+        "Video views 7d",
+        "Video engagement rate",
         "Commission %",
         "Rating",
         "Discount %",
@@ -253,14 +358,13 @@
       "default": "top_score"
     },
     "includeRawProviderData": {
-      "title": "Include raw provider data",
+      "title": "Include raw base-provider data",
       "type": "boolean",
-      "description": "Include the complete original search-provider record in each Dataset row for debugging and discovery of additional fields.",
+      "description": "Include the original base-search row inside each product for debugging and field discovery.",
       "default": false
     }
   },
   "required": [
-    "keywords",
     "region"
   ]
 }
