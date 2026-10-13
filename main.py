@@ -7,13 +7,22 @@ import json
 import math
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from apify import Actor
 
 
+VERSION = "6.0-advanced"
 DEFAULT_SEARCH_ACTOR_ID = "getanyapi/tiktok-shop-scraper"
-DEFAULT_HISTORY_STORE = "tiktok-shop-top-products-history"
+DEFAULT_MARKET_ACTOR_ID = "lergassy/tiktok-shop-top-products-scraper"
+DEFAULT_CREATORS_ACTOR_ID = "lergassy/tiktok-shop-creators-scraper"
+DEFAULT_VIDEOS_ACTOR_ID = "lergassy/tiktok-shop-videos-scraper"
+DEFAULT_HISTORY_STORE = "tiktok-shop-top-products-v6-history"
+
+SUPPORTED_MARKET_INTEL_REGIONS = {
+    "US", "GB", "ID", "TH", "VN", "PH", "MY", "SG",
+    "JP", "MX", "DE", "IT", "FR", "ES", "BR",
+}
 
 CATEGORY_QUERY_MAP = {
     "beauty": "Beauty",
@@ -37,6 +46,12 @@ CURRENCY_BY_REGION = {
     "VN": "VND",
     "PH": "PHP",
     "ID": "IDR",
+    "JP": "JPY",
+    "MX": "MXN",
+    "IT": "EUR",
+    "FR": "EUR",
+    "ES": "EUR",
+    "BR": "BRL",
 }
 
 
@@ -262,6 +277,28 @@ def recursive_find_bool(
 ) -> Tuple[Optional[str], Optional[bool]]:
     key, raw = recursive_find_with_key(value, aliases)
     return key, as_bool(raw)
+
+
+def product_id_from_any(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if re.fullmatch(r"\d{16,22}", text):
+        return text
+    match = re.search(r"(?<!\d)(\d{16,22})(?!\d)", text)
+    return match.group(1) if match else None
+
+
+def add_source(product: Dict[str, Any], source: str) -> None:
+    sources = list(product.get("dataSources") or [])
+    if source and source not in sources:
+        sources.append(source)
+    product["dataSources"] = sources
+
+
+def merge_if_missing(product: Dict[str, Any], field: str, value: Any) -> None:
+    if product.get(field) is None and value is not None:
+        product[field] = value
 
 
 # ---------------------------------------------------------------------------
@@ -498,10 +535,11 @@ def normalize_product(
     product: Dict[str, Any] = {
         "type": "product",
         "source": raw.get("source") or provider_actor_id,
+        "dataSources": [raw.get("source") or provider_actor_id],
         "searchQuery": query,
         "searchQueries": [query],
         "region": region.upper(),
-        "productId": str(raw.get("productId")) if raw.get("productId") is not None else None,
+        "productId": (str(raw.get("productId")) if raw.get("productId") is not None else product_id_from_any(raw.get("url") or raw.get("productUrl"))),
         "title": raw.get("title"),
         "description": (
             raw.get("description")
@@ -667,6 +705,417 @@ def deduplicate_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         existing["searchQueries"] = queries
 
     return list(deduped.values())
+
+
+# ---------------------------------------------------------------------------
+# Advanced multi-source market / creator / video intelligence
+# ---------------------------------------------------------------------------
+
+async def read_run_dataset(run: Any, *, limit: int) -> List[Dict[str, Any]]:
+    if run is None:
+        return []
+    run_client = Actor.apify_client.run(run.id)
+    dataset_client = run_client.dataset()
+    page = await dataset_client.list_items(limit=max(1, limit))
+    return [item for item in (page.items or []) if isinstance(item, dict)]
+
+
+async def call_market_intelligence(
+    *,
+    actor_id: str,
+    keywords: Sequence[str],
+    categories: Sequence[str],
+    region: str,
+    period: str,
+    max_results_per_source: int,
+    add_analytics: bool,
+    overall_top: bool,
+    log,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if region not in SUPPORTED_MARKET_INTEL_REGIONS:
+        return [], f"Market intelligence source does not support region {region}."
+
+    run_input: Dict[str, Any] = {
+        "country": region,
+        "period": period,
+        "sortBy": "unitsSold",
+        "maxResultsPerSource": max_results_per_source,
+        "addAnalytics": add_analytics,
+    }
+    if not overall_top:
+        if keywords:
+            run_input["keywords"] = list(keywords)
+        if categories:
+            run_input["categories"] = list(categories)
+
+    try:
+        log.info(
+            f"[MARKET] actor={actor_id} region={region} period={period} "
+            f"overall={overall_top} keywords={len(keywords)} categories={len(categories)}"
+        )
+        run = await Actor.call(actor_id=actor_id, run_input=run_input)
+        sources = 1 if overall_top else max(1, len(keywords) + len(categories))
+        rows = await read_run_dataset(
+            run,
+            limit=max_results_per_source * sources + 50,
+        )
+        rows = [
+            row for row in rows
+            if str(row.get("type", "product")).lower() == "product"
+            and product_id_from_any(row.get("productId") or row.get("url"))
+        ]
+        log.info(f"[MARKET] {period}: {len(rows)} product rows")
+        return rows, None
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        log.warning(f"[MARKET] {period} failed: {message}")
+        return [], message
+
+
+async def call_creators_enrichment(
+    *,
+    actor_id: str,
+    product_inputs: Sequence[str],
+    region: str,
+    max_results_per_product: int,
+    log,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not product_inputs:
+        return [], None
+    try:
+        log.info(
+            f"[CREATORS] actor={actor_id} products={len(product_inputs)} region={region}"
+        )
+        run = await Actor.call(
+            actor_id=actor_id,
+            run_input={
+                "productIds": list(product_inputs),
+                "country": region,
+                "period": "last7Day",
+                "sortBy": "revenue",
+                "maxResultsPerSource": max_results_per_product,
+                "addAnalytics": False,
+            },
+        )
+        rows = await read_run_dataset(
+            run,
+            limit=len(product_inputs) * max_results_per_product + 50,
+        )
+        rows = [
+            row for row in rows
+            if str(row.get("type", "creator")).lower() == "creator"
+        ]
+        log.info(f"[CREATORS] {len(rows)} creator rows")
+        return rows, None
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        log.warning(f"[CREATORS] failed: {message}")
+        return [], message
+
+
+async def call_videos_enrichment(
+    *,
+    actor_id: str,
+    product_inputs: Sequence[str],
+    region: str,
+    max_results_per_product: int,
+    log,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not product_inputs:
+        return [], None
+    try:
+        log.info(
+            f"[VIDEOS] actor={actor_id} products={len(product_inputs)} region={region}"
+        )
+        run = await Actor.call(
+            actor_id=actor_id,
+            run_input={
+                "productIds": list(product_inputs),
+                "country": region,
+                "period": "last7Day",
+                "sortBy": "revenue",
+                "maxResultsPerSource": max_results_per_product,
+                "aiVideos": "all",
+                "addAnalytics": False,
+            },
+        )
+        rows = await read_run_dataset(
+            run,
+            limit=len(product_inputs) * max_results_per_product + 50,
+        )
+        rows = [
+            row for row in rows
+            if str(row.get("type", "video")).lower() == "video"
+        ]
+        log.info(f"[VIDEOS] {len(rows)} video rows")
+        return rows, None
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        log.warning(f"[VIDEOS] failed: {message}")
+        return [], message
+
+
+def create_product_from_market_row(
+    row: Dict[str, Any],
+    *,
+    region: str,
+    actor_id: str,
+) -> Dict[str, Any]:
+    product_id = product_id_from_any(row.get("productId") or row.get("url"))
+    return {
+        "type": "product",
+        "source": actor_id,
+        "dataSources": [actor_id],
+        "searchQuery": None,
+        "searchQueries": [],
+        "region": region,
+        "productId": product_id,
+        "title": row.get("title"),
+        "description": None,
+        "productUrl": row.get("url"),
+        "image": row.get("image"),
+        "shopName": row.get("shopName"),
+        "sellerId": str(row.get("shopId")) if row.get("shopId") is not None else None,
+        "priceRaw": None,
+        "originalPriceRaw": None,
+        "currentPrice": None,
+        "originalPrice": None,
+        "currency": CURRENCY_BY_REGION.get(region),
+        "currencyInferred": True,
+        "discountPercent": None,
+        "priceNormalizationMode": "market_intel_usd_only",
+        "soldCount": None,
+        "rating": None,
+        "reviewCount": as_int(row.get("reviewCount")),
+        "creatorCount": as_int(row.get("creatorCount")),
+        "videoCount": as_int(row.get("videoCount")),
+        "views": None,
+        "likes": None,
+        "comments": None,
+        "shares": None,
+        "engagementRate": None,
+        "commissionPercent": as_float(row.get("commissionRatePercent")),
+        "stock": None,
+        "inStock": None,
+        "listedAt": iso_or_none(row.get("launchDate")),
+        "providerFieldKeys": {},
+        "commissionRaw": row.get("commissionRatePercent"),
+    }
+
+
+def merge_market_row(
+    product: Dict[str, Any],
+    row: Dict[str, Any],
+    *,
+    period: str,
+    actor_id: str,
+) -> None:
+    add_source(product, actor_id)
+    merge_if_missing(product, "title", row.get("title"))
+    merge_if_missing(product, "productUrl", row.get("url"))
+    merge_if_missing(product, "listedAt", iso_or_none(row.get("launchDate")))
+
+    commission = as_float(row.get("commissionRatePercent"))
+    if commission is not None and 0 <= commission <= 100:
+        product["commissionPercent"] = round(commission, 2)
+        product["commissionSource"] = f"{actor_id}:{period}"
+
+    for field, value in {
+        "creatorCount": as_int(row.get("creatorCount")),
+        "videoCount": as_int(row.get("videoCount")),
+        "liveCount": as_int(row.get("liveCount")),
+        "reviewCount": as_int(row.get("reviewCount")),
+        "marketMinPriceUSD": as_float(row.get("minPrice")),
+        "marketMaxPriceUSD": as_float(row.get("maxPrice")),
+        "marketShopId": str(row.get("shopId")) if row.get("shopId") is not None else None,
+        "categoryIds": row.get("categoryIds"),
+        "deliveryType": row.get("deliveryType"),
+    }.items():
+        if value is not None:
+            product[field] = value
+            if field in {"creatorCount", "videoCount", "reviewCount"}:
+                product[f"{field}Source"] = f"{actor_id}:{period}"
+
+    units = as_int(row.get("unitsSold"))
+    revenue = as_float(row.get("revenue"))
+    avg_price = as_float(row.get("avgSellingPrice"))
+    growth = as_float(row.get("revenueGrowthPercent"))
+    video_revenue = as_float(row.get("videoRevenue"))
+    live_revenue = as_float(row.get("liveRevenue"))
+    shop_window_revenue = as_float(row.get("shopWindowRevenue"))
+
+    if period == "lastDay":
+        product["marketSold24h"] = units
+        product["marketRevenueUSD24h"] = revenue
+        product["marketAvgSellingPriceUSD24h"] = avg_price
+        product["marketRevenueGrowthPercent24h"] = growth
+        product["marketVideoRevenueUSD24h"] = video_revenue
+        product["marketLiveRevenueUSD24h"] = live_revenue
+        product["marketShopWindowRevenueUSD24h"] = shop_window_revenue
+    elif period == "last7Day":
+        product["marketSold7d"] = units
+        product["marketRevenueUSD7d"] = revenue
+        product["marketAvgSellingPriceUSD7d"] = avg_price
+        product["marketRevenueGrowthPercent7d"] = growth
+        product["marketVideoRevenueUSD7d"] = video_revenue
+        product["marketLiveRevenueUSD7d"] = live_revenue
+        product["marketShopWindowRevenueUSD7d"] = shop_window_revenue
+    product[f"marketRank_{period}"] = as_int(row.get("rank"))
+
+
+def merge_market_rows_into_products(
+    products: List[Dict[str, Any]],
+    *,
+    rows: Sequence[Dict[str, Any]],
+    period: str,
+    actor_id: str,
+    region: str,
+    include_market_only_products: bool,
+) -> List[Dict[str, Any]]:
+    by_id = {
+        str(product["productId"]): product
+        for product in products
+        if product.get("productId")
+    }
+    for row in rows:
+        product_id = product_id_from_any(row.get("productId") or row.get("url"))
+        if not product_id:
+            continue
+        product = by_id.get(product_id)
+        if product is None and include_market_only_products:
+            product = create_product_from_market_row(
+                row,
+                region=region,
+                actor_id=actor_id,
+            )
+            products.append(product)
+            by_id[product_id] = product
+        if product is not None:
+            merge_market_row(product, row, period=period, actor_id=actor_id)
+    return products
+
+
+def product_id_from_source_row(row: Dict[str, Any]) -> Optional[str]:
+    for key in ("productId", "sourceInput", "productUrl", "sourceUrl"):
+        product_id = product_id_from_any(row.get(key))
+        if product_id:
+            return product_id
+    return None
+
+
+def aggregate_creators(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for row in rows:
+        product_id = product_id_from_source_row(row)
+        creator_id = row.get("creatorId") or row.get("username")
+        if not product_id or not creator_id:
+            continue
+        grouped.setdefault(product_id, {})[str(creator_id)] = row
+
+    output: Dict[str, Dict[str, Any]] = {}
+    for product_id, creator_map in grouped.items():
+        creator_rows = list(creator_map.values())
+        top = max(creator_rows, key=lambda r: as_float(r.get("revenue")) or 0.0)
+        output[product_id] = {
+            "creatorCountObserved7d": len(creator_rows),
+            "creatorRevenueUSD7d": round(sum(as_float(r.get("revenue")) or 0 for r in creator_rows), 2),
+            "creatorUnitsSold7d": sum(as_int(r.get("unitsSold")) or 0 for r in creator_rows),
+            "creatorContentViews7d": sum(as_int(r.get("contentViews")) or 0 for r in creator_rows),
+            "topCreatorUsername7d": top.get("username"),
+            "topCreatorRevenueUSD7d": round_or_none(as_float(top.get("revenue")), 2),
+        }
+    return output
+
+
+def aggregate_videos(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for row in rows:
+        product_id = product_id_from_source_row(row)
+        video_id = row.get("videoId") or row.get("url")
+        if not product_id or not video_id:
+            continue
+        grouped.setdefault(product_id, {})[str(video_id)] = row
+
+    output: Dict[str, Dict[str, Any]] = {}
+    for product_id, video_map in grouped.items():
+        video_rows = list(video_map.values())
+        total_views = sum(as_int(r.get("views")) or 0 for r in video_rows)
+        total_likes = sum(as_int(r.get("likes")) or 0 for r in video_rows)
+        total_comments = sum(as_int(r.get("comments")) or 0 for r in video_rows)
+        total_shares = sum(as_int(r.get("shares")) or 0 for r in video_rows)
+        total_revenue = sum(as_float(r.get("revenue")) or 0 for r in video_rows)
+        top = max(video_rows, key=lambda r: as_float(r.get("revenue")) or 0.0)
+        unique_creators = {
+            str(r.get("creatorId") or r.get("creatorUsername"))
+            for r in video_rows
+            if r.get("creatorId") or r.get("creatorUsername")
+        }
+        engagement = (
+            round(((total_likes + total_comments + total_shares) / total_views) * 100, 4)
+            if total_views > 0 else None
+        )
+        output[product_id] = {
+            "videoCountObserved7d": len(video_rows),
+            "videoViews7d": total_views,
+            "videoLikes7d": total_likes,
+            "videoComments7d": total_comments,
+            "videoShares7d": total_shares,
+            "videoEngagementRate7d": engagement,
+            "videoRevenueUSD7d": round(total_revenue, 2),
+            "videoCreatorCountObserved7d": len(unique_creators),
+            "topVideoUrl7d": top.get("url"),
+            "topVideoRevenueUSD7d": round_or_none(as_float(top.get("revenue")), 2),
+        }
+    return output
+
+
+def merge_creator_video_aggregates(
+    products: Sequence[Dict[str, Any]],
+    *,
+    creator_aggregates: Dict[str, Dict[str, Any]],
+    video_aggregates: Dict[str, Dict[str, Any]],
+    creators_actor_id: str,
+    videos_actor_id: str,
+) -> None:
+    for product in products:
+        product_id = str(product.get("productId") or "")
+        if not product_id:
+            continue
+        creator_metrics = creator_aggregates.get(product_id)
+        if creator_metrics:
+            product.update(creator_metrics)
+            add_source(product, creators_actor_id)
+            if product.get("creatorCount") is None:
+                product["creatorCount"] = creator_metrics["creatorCountObserved7d"]
+                product["creatorCountSource"] = f"{creators_actor_id}:observed7d"
+        video_metrics = video_aggregates.get(product_id)
+        if video_metrics:
+            product.update(video_metrics)
+            add_source(product, videos_actor_id)
+            if product.get("videoCount") is None:
+                product["videoCount"] = video_metrics["videoCountObserved7d"]
+                product["videoCountSource"] = f"{videos_actor_id}:observed7d"
+            if product.get("views") is None:
+                product["views"] = video_metrics["videoViews7d"]
+                product["viewsSource"] = f"{videos_actor_id}:7d"
+            product["likes"] = video_metrics["videoLikes7d"]
+            product["comments"] = video_metrics["videoComments7d"]
+            product["shares"] = video_metrics["videoShares7d"]
+            product["engagementRate"] = video_metrics["videoEngagementRate7d"]
+
+
+def select_enrichment_products(
+    products: Sequence[Dict[str, Any]],
+    max_products: int,
+) -> List[Dict[str, Any]]:
+    return sorted(
+        products,
+        key=lambda p: (
+            as_float(p.get("marketSold7d")) if as_float(p.get("marketSold7d")) is not None else -1,
+            as_float(p.get("soldCount")) if as_float(p.get("soldCount")) is not None else -1,
+        ),
+        reverse=True,
+    )[:max_products]
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1730,282 @@ def sort_products(products: List[Dict[str, Any]], sort_by: str) -> List[Dict[str
 
 
 # ---------------------------------------------------------------------------
+# v6 finalization, quality and scoring (overrides v5 ranking functions)
+# ---------------------------------------------------------------------------
+
+STRATEGIC_FIELDS = (
+    "sold24h", "sold7d", "currentPrice", "rating", "reviewCount",
+    "creatorCount", "videoCount", "videoViews7d", "commissionPercent",
+    "stock", "productAgeDays",
+)
+
+
+def finalize_v6_metrics(product: Dict[str, Any], now: datetime) -> None:
+    history_sold24h = as_float(product.get("sold24h"))
+    history_sold7d = as_float(product.get("sold7d"))
+    history_sales_growth = as_float(product.get("salesGrowth7d"))
+
+    product["historySold24h"] = round_or_none(history_sold24h, 0)
+    product["historySold7d"] = round_or_none(history_sold7d, 0)
+    product["historySalesGrowth7d"] = history_sales_growth
+
+    market_sold24h = as_float(product.get("marketSold24h"))
+    market_sold7d = as_float(product.get("marketSold7d"))
+
+    if market_sold24h is not None:
+        product["sold24h"] = int(round(market_sold24h))
+        product["sold24hSource"] = "market_intelligence"
+    elif history_sold24h is not None:
+        product["sold24h"] = int(round(history_sold24h))
+        product["sold24hSource"] = "own_history"
+    else:
+        product["sold24h"] = None
+        product["sold24hSource"] = None
+
+    if market_sold7d is not None:
+        product["sold7d"] = int(round(market_sold7d))
+        product["sold7dSource"] = "market_intelligence"
+    elif history_sold7d is not None:
+        product["sold7d"] = int(round(history_sold7d))
+        product["sold7dSource"] = "own_history"
+    else:
+        product["sold7d"] = None
+        product["sold7dSource"] = None
+
+    sold24h = as_float(product.get("sold24h"))
+    sold7d = as_float(product.get("sold7d"))
+    product["avgDailySales7d"] = round(sold7d / 7, 2) if sold7d is not None else None
+    product["salesVelocityRatio"] = (
+        round(sold24h / (sold7d / 7), 3)
+        if sold24h is not None and sold7d is not None and sold7d > 0
+        else None
+    )
+
+    revenue_growth = as_float(product.get("marketRevenueGrowthPercent7d"))
+    product["revenueGrowth7d"] = revenue_growth
+    product["revenueGrowth7dSource"] = "market_intelligence" if revenue_growth is not None else None
+    product["salesGrowth7d"] = history_sales_growth
+    product["salesGrowth7dSource"] = "own_history" if history_sales_growth is not None else None
+
+    listed_at = parse_datetime(product.get("listedAt"))
+    if listed_at is not None:
+        product["productAgeDays"] = round(max(0, (now - listed_at).total_seconds() / 86400), 2)
+        product["ageSource"] = "market_launch_date_or_provider"
+
+    if product.get("creatorCount") is None and product.get("creatorCountObserved7d") is not None:
+        product["creatorCount"] = product["creatorCountObserved7d"]
+        product["creatorCountSource"] = "creator_observation_7d"
+    if product.get("videoCount") is None and product.get("videoCountObserved7d") is not None:
+        product["videoCount"] = product["videoCountObserved7d"]
+        product["videoCountSource"] = "video_observation_7d"
+    if product.get("views") is None and product.get("videoViews7d") is not None:
+        product["views"] = product["videoViews7d"]
+        product["viewsSource"] = "video_observation_7d"
+
+    if product.get("videoEngagementRate7d") is not None:
+        product["engagementRate"] = product["videoEngagementRate7d"]
+
+    trend_signals: List[float] = []
+    velocity = as_float(product.get("salesVelocityRatio"))
+    if velocity is not None:
+        trend_signals.append((velocity - 1.0) * 100)
+    if history_sales_growth is not None:
+        trend_signals.append(history_sales_growth)
+    if revenue_growth is not None:
+        trend_signals.append(revenue_growth)
+
+    if trend_signals:
+        strength = sum(trend_signals) / len(trend_signals)
+        product["trendStrength"] = round(strength, 2)
+        product["trend"] = "RISING" if strength >= 15 else "FALLING" if strength <= -15 else "STABLE"
+    else:
+        product["trendStrength"] = None
+        product["trend"] = "UNKNOWN"
+
+    current_price = as_float(product.get("currentPrice"))
+    product["estimatedGMVLocal24h"] = (
+        round(current_price * sold24h, 2)
+        if current_price is not None and sold24h is not None else None
+    )
+    product["estimatedGMVLocal7d"] = (
+        round(current_price * sold7d, 2)
+        if current_price is not None and sold7d is not None else None
+    )
+
+    present = sum(1 for field in STRATEGIC_FIELDS if product.get(field) is not None)
+    product["dataCoveragePercent"] = round((present / len(STRATEGIC_FIELDS)) * 100, 2)
+    product["missingStrategicFields"] = [field for field in STRATEGIC_FIELDS if product.get(field) is None]
+
+    flags: List[str] = []
+    if product.get("currentPrice") is None:
+        flags.append("NO_LOCAL_CURRENT_PRICE")
+    raw_price = as_float(product.get("priceRaw"))
+    if product.get("priceNormalizationMode") == "auto" and raw_price is not None and raw_price < 100 and abs(raw_price-round(raw_price)) < 1e-9:
+        flags.append("SMALL_INTEGER_PRICE_VERIFY")
+    if product.get("soldCount") is None and product.get("sold7d") is None:
+        flags.append("NO_SALES_SIGNAL")
+    if product.get("commissionPercent") is None:
+        flags.append("NO_COMMISSION_DATA")
+    if product.get("stock") is None:
+        flags.append("NO_STOCK_DATA")
+    if product.get("creatorCount") is None:
+        flags.append("NO_CREATOR_DATA")
+    if product.get("videoViews7d") is None:
+        flags.append("NO_VIDEO_DATA")
+    product["dataQualityFlags"] = flags
+
+
+def percentile_scores_v6(products: List[Dict[str, Any]], field: str) -> Dict[int, float]:
+    pairs = [(i, as_float(p.get(field))) for i, p in enumerate(products)]
+    pairs = [(i, value) for i, value in pairs if value is not None]
+    if not pairs:
+        return {}
+    ordered = sorted(value for _, value in pairs)
+    n = len(ordered)
+    return {i: sum(1 for candidate in ordered if candidate <= value) / n for i, value in pairs}
+
+
+def calculate_top_product_scores(products: List[Dict[str, Any]]) -> None:
+    percentile_fields = {
+        field: percentile_scores_v6(products, field)
+        for field in (
+            "sold7d", "sold24h", "salesVelocityRatio", "revenueGrowth7d",
+            "creatorCount", "creatorGrowth7d", "videoViews7d",
+            "reviewGrowth7d", "soldCount",
+        )
+    }
+    weights = {
+        "sold7d": 0.20,
+        "sold24h": 0.08,
+        "salesVelocityRatio": 0.10,
+        "revenueGrowth7d": 0.10,
+        "creatorCount": 0.08,
+        "creatorGrowth7d": 0.06,
+        "videoViews7d": 0.08,
+        "engagementRate": 0.05,
+        "commissionPercent": 0.08,
+        "rating": 0.04,
+        "reviewGrowth7d": 0.04,
+        "discountPercent": 0.03,
+        "productAgeDays": 0.03,
+        "stockAvailability": 0.01,
+        "soldCount": 0.02,
+    }
+    for index, product in enumerate(products):
+        total = 0.0
+        coverage = 0.0
+        components: Dict[str, Optional[float]] = {}
+
+        def add(name: str, score: Optional[float]) -> None:
+            nonlocal total, coverage
+            components[name] = round(score * 100, 2) if score is not None else None
+            if score is not None:
+                total += score * weights[name]
+                coverage += weights[name]
+
+        for field in (
+            "sold7d", "sold24h", "salesVelocityRatio", "revenueGrowth7d",
+            "creatorCount", "creatorGrowth7d", "videoViews7d",
+            "reviewGrowth7d", "soldCount",
+        ):
+            add(field, percentile_fields[field].get(index))
+
+        add("engagementRate", direct_ratio(product.get("engagementRate"), 10.0))
+        add("commissionPercent", direct_ratio(product.get("commissionPercent"), 20.0))
+        add("rating", direct_ratio(product.get("rating"), 5.0))
+        add("discountPercent", direct_ratio(product.get("discountPercent"), 50.0))
+        age = as_float(product.get("productAgeDays"))
+        add("productAgeDays", None if age is None else max(0, min(1, 1 - age / 180)))
+
+        stock_score = None
+        if product.get("inStock") is True:
+            stock_score = 1.0
+        elif product.get("inStock") is False:
+            stock_score = 0.0
+        elif as_float(product.get("stock")) is not None:
+            stock_score = 1.0 if as_float(product.get("stock")) > 0 else 0.0
+        add("stockAvailability", stock_score)
+
+        if coverage > 0:
+            raw_score = total / coverage * 100
+            product["rawOpportunityScore"] = round(raw_score, 2)
+            product["scoreCoveragePercent"] = round(coverage * 100, 2)
+            product["topProductScore"] = round(raw_score * math.sqrt(coverage), 2)
+        else:
+            product["rawOpportunityScore"] = None
+            product["scoreCoveragePercent"] = 0.0
+            product["topProductScore"] = None
+        product["scoreComponents"] = components
+
+
+def product_passes_filters(
+    product: Dict[str, Any],
+    *,
+    only_discounted: bool,
+    only_in_stock: bool,
+    min_discount: float,
+    min_sold_total: int,
+    min_sold_24h: int,
+    min_sold_7d: int,
+    min_rating: float,
+    min_commission: float,
+    min_creator_count: int = 0,
+    min_video_views_7d: int = 0,
+    min_top_score: float = 0,
+) -> bool:
+    if only_discounted:
+        discount = as_float(product.get("discountPercent"))
+        if discount is None or discount <= 0:
+            return False
+    if only_in_stock and product.get("inStock") is not True:
+        return False
+    checks = (
+        ("discountPercent", min_discount),
+        ("soldCount", min_sold_total),
+        ("sold24h", min_sold_24h),
+        ("sold7d", min_sold_7d),
+        ("rating", min_rating),
+        ("commissionPercent", min_commission),
+        ("creatorCount", min_creator_count),
+        ("videoViews7d", min_video_views_7d),
+        ("topProductScore", min_top_score),
+    )
+    return all(metric_at_least(product, field, minimum) for field, minimum in checks)
+
+
+SORT_FIELD_MAP = {
+    "top_score": "topProductScore",
+    "sold24h": "sold24h",
+    "sold7d": "sold7d",
+    "sales_velocity": "salesVelocityRatio",
+    "revenue_growth": "revenueGrowth7d",
+    "creator_count": "creatorCount",
+    "creator_growth": "creatorGrowth7d",
+    "views7d": "videoViews7d",
+    "engagement": "engagementRate",
+    "commission": "commissionPercent",
+    "rating": "rating",
+    "discount": "discountPercent",
+    "sold_total": "soldCount",
+    "price": "currentPrice",
+}
+
+
+def sort_products(products: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
+    field = SORT_FIELD_MAP.get(sort_by, "topProductScore")
+    def key(product: Dict[str, Any]) -> Tuple[float, float, float]:
+        primary = as_float(product.get(field))
+        sold7d = as_float(product.get("sold7d"))
+        sold_total = as_float(product.get("soldCount"))
+        return (
+            primary if primary is not None else float("-inf"),
+            sold7d if sold7d is not None else float("-inf"),
+            sold_total if sold_total is not None else float("-inf"),
+        )
+    return sorted(products, key=key, reverse=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1288,87 +2013,53 @@ async def main() -> None:
     async with Actor:
         log = Actor.log
         input_data = await Actor.get_input() or {}
+        now = datetime.now(timezone.utc)
 
         region = str(input_data.get("region", "DE")).strip().upper() or "DE"
-
-        search_actor_id = (
-            str(input_data.get("searchActorId", DEFAULT_SEARCH_ACTOR_ID)).strip()
-            or DEFAULT_SEARCH_ACTOR_ID
-        )
+        search_actor_id = str(input_data.get("searchActorId", DEFAULT_SEARCH_ACTOR_ID)).strip() or DEFAULT_SEARCH_ACTOR_ID
+        market_actor_id = str(input_data.get("marketActorId", DEFAULT_MARKET_ACTOR_ID)).strip() or DEFAULT_MARKET_ACTOR_ID
+        creators_actor_id = str(input_data.get("creatorsActorId", DEFAULT_CREATORS_ACTOR_ID)).strip() or DEFAULT_CREATORS_ACTOR_ID
+        videos_actor_id = str(input_data.get("videosActorId", DEFAULT_VIDEOS_ACTOR_ID)).strip() or DEFAULT_VIDEOS_ACTOR_ID
 
         keywords = input_data.get("keywords") or []
-        categories = input_data.get("tiktokCategories") or []
-
+        categories = input_data.get("categories") or []
         if isinstance(keywords, str):
             keywords = [keywords]
-
         if isinstance(categories, str):
             categories = [categories]
+        keywords = [str(x).strip() for x in keywords if str(x).strip()]
+        categories = [str(x).strip() for x in categories if str(x).strip()]
 
-        search_queries: List[str] = []
+        search_queries = list(dict.fromkeys(
+            keywords + [CATEGORY_QUERY_MAP.get(cat.lower(), cat) for cat in categories]
+        ))
+        overall_top = bool(input_data.get("marketOverallTop", False))
+        if not search_queries and not overall_top:
+            raise ValueError("Add at least one keyword/category or enable Market overall top.")
 
-        for keyword in keywords:
-            value = str(keyword).strip()
-            if value:
-                search_queries.append(value)
-
-        for category in categories:
-            value = str(category).strip()
-            if not value:
-                continue
-            search_queries.append(
-                CATEGORY_QUERY_MAP.get(value.lower(), value)
-            )
-
-        search_queries = list(dict.fromkeys(search_queries))
-
-        if not search_queries:
-            raise ValueError(
-                "Add at least one keyword or TikTok category."
-            )
-
-        max_items = max(1, min(1000, int(input_data.get("maxItems", 100))))
-        max_output_products = max(
-            1,
-            min(1000, int(input_data.get("maxOutputProducts", 100))),
-        )
+        max_search_items = max(1, min(1000, int(input_data.get("maxSearchItemsPerQuery", 100))))
+        max_market_items = max(1, min(1000, int(input_data.get("maxMarketItemsPerSource", 50))))
+        max_output_products = max(1, min(1000, int(input_data.get("maxOutputProducts", 100))))
+        max_enrichment_products = max(1, min(100, int(input_data.get("maxEnrichmentProducts", 5))))
+        max_creators_per_product = max(1, min(100, int(input_data.get("maxCreatorsPerProduct", 20))))
+        max_videos_per_product = max(1, min(100, int(input_data.get("maxVideosPerProduct", 20))))
 
         price_mode = str(input_data.get("priceMode", "auto")).strip().lower()
         if price_mode not in {"auto", "raw", "minor_units"}:
             raise ValueError("priceMode must be auto, raw, or minor_units.")
-
         price_divisor = float(input_data.get("priceDivisor", 100) or 100)
-        auto_minor_threshold = float(
-            input_data.get("autoMinorUnitThreshold", 100) or 100
-        )
+        auto_minor_threshold = float(input_data.get("autoMinorUnitThreshold", 100) or 100)
+        include_raw_provider_data = bool(input_data.get("includeRawProviderData", False))
 
-        include_raw_provider_data = bool(
-            input_data.get("includeRawProviderData", False)
-        )
+        errors: List[Dict[str, str]] = []
+        all_search_products: List[Dict[str, Any]] = []
 
-        track_history = bool(input_data.get("trackHistory", True))
-        history_store_name = sanitize_store_name(
-            str(input_data.get("historyStoreName", DEFAULT_HISTORY_STORE))
-        )
-        max_snapshots = max(
-            10,
-            min(5000, int(input_data.get("maxSnapshotsPerProduct", 500))),
-        )
-        tolerance_hours = max(
-            1.0,
-            min(72.0, float(input_data.get("windowToleranceHours", 18) or 18)),
-        )
-
-        now = datetime.now(timezone.utc)
-
-        all_products: List[Dict[str, Any]] = []
-        search_errors: List[Dict[str, str]] = []
-
+        # 1) Base search: local price, total sold, rating, shop, image.
         for query in search_queries:
-            products, error = await call_search_provider(
+            rows, error = await call_search_provider(
                 query=query,
                 region=region,
-                max_items=max_items,
+                max_items=max_search_items,
                 search_actor_id=search_actor_id,
                 price_mode=price_mode,
                 price_divisor=price_divisor,
@@ -1376,21 +2067,118 @@ async def main() -> None:
                 include_raw_provider_data=include_raw_provider_data,
                 log=log,
             )
-
-            all_products.extend(products)
-
+            all_search_products.extend(rows)
             if error:
-                search_errors.append({"query": query, "error": error})
+                errors.append({"stage": "search", "query": query, "error": error})
 
-        products = deduplicate_products(all_products)
+        products = deduplicate_products(all_search_products)
+        for product in products:
+            if not product.get("dataSources"):
+                product["dataSources"] = [product.get("source") or search_actor_id]
 
-        history_store = None
+        # 2) Direct recent-market intelligence for last 24h and last 7d.
+        market_enabled = bool(input_data.get("enableMarketIntelligence", True))
+        market_paid_analytics = bool(input_data.get("enableMarketPaidAnalytics", False))
+        include_market_only = bool(input_data.get("includeMarketOnlyProducts", True))
+        market_rows_24h: List[Dict[str, Any]] = []
+        market_rows_7d: List[Dict[str, Any]] = []
 
-        if track_history:
-            history_store = await Actor.open_key_value_store(
-                name=history_store_name
+        if market_enabled:
+            market_rows_24h, err = await call_market_intelligence(
+                actor_id=market_actor_id,
+                keywords=keywords,
+                categories=categories,
+                region=region,
+                period="lastDay",
+                max_results_per_source=max_market_items,
+                add_analytics=market_paid_analytics,
+                overall_top=overall_top,
+                log=log,
+            )
+            if err:
+                errors.append({"stage": "market_lastDay", "error": err})
+
+            market_rows_7d, err = await call_market_intelligence(
+                actor_id=market_actor_id,
+                keywords=keywords,
+                categories=categories,
+                region=region,
+                period="last7Day",
+                max_results_per_source=max_market_items,
+                add_analytics=market_paid_analytics,
+                overall_top=overall_top,
+                log=log,
+            )
+            if err:
+                errors.append({"stage": "market_last7Day", "error": err})
+
+            products = merge_market_rows_into_products(
+                products,
+                rows=market_rows_24h,
+                period="lastDay",
+                actor_id=market_actor_id,
+                region=region,
+                include_market_only_products=include_market_only,
+            )
+            products = merge_market_rows_into_products(
+                products,
+                rows=market_rows_7d,
+                period="last7Day",
+                actor_id=market_actor_id,
+                region=region,
+                include_market_only_products=include_market_only,
             )
 
+        # 3) Optional creator/video intelligence only for the strongest products.
+        enrichment_products = select_enrichment_products(products, max_enrichment_products)
+        product_inputs = [
+            str(product.get("productUrl") or product.get("productId"))
+            for product in enrichment_products
+            if product.get("productUrl") or product.get("productId")
+        ]
+        creator_rows: List[Dict[str, Any]] = []
+        video_rows: List[Dict[str, Any]] = []
+
+        if bool(input_data.get("enableCreatorEnrichment", False)):
+            creator_rows, err = await call_creators_enrichment(
+                actor_id=creators_actor_id,
+                product_inputs=product_inputs,
+                region=region,
+                max_results_per_product=max_creators_per_product,
+                log=log,
+            )
+            if err:
+                errors.append({"stage": "creators", "error": err})
+
+        if bool(input_data.get("enableVideoEnrichment", False)):
+            video_rows, err = await call_videos_enrichment(
+                actor_id=videos_actor_id,
+                product_inputs=product_inputs,
+                region=region,
+                max_results_per_product=max_videos_per_product,
+                log=log,
+            )
+            if err:
+                errors.append({"stage": "videos", "error": err})
+
+        merge_creator_video_aggregates(
+            products,
+            creator_aggregates=aggregate_creators(creator_rows),
+            video_aggregates=aggregate_videos(video_rows),
+            creators_actor_id=creators_actor_id,
+            videos_actor_id=videos_actor_id,
+        )
+
+        # 4) Own persistent snapshots remain a second, independent history source.
+        track_history = bool(input_data.get("trackHistory", True))
+        history_store_name = sanitize_store_name(
+            str(input_data.get("historyStoreName", DEFAULT_HISTORY_STORE))
+        )
+        max_snapshots = max(10, min(5000, int(input_data.get("maxSnapshotsPerProduct", 500))))
+        tolerance_hours = max(1.0, min(72.0, float(input_data.get("windowToleranceHours", 18) or 18)))
+
+        if track_history:
+            history_store = await Actor.open_key_value_store(name=history_store_name)
             for product in products:
                 await enrich_product_with_history(
                     product,
@@ -1402,83 +2190,52 @@ async def main() -> None:
                 )
         else:
             for product in products:
-                product.update(
-                    {
-                        "snapshotAt": now.isoformat(),
-                        "firstSeen": None,
-                        "observedAgeDays": None,
-                        "productAgeDays": (
-                            round(
-                                max(
-                                    0.0,
-                                    (
-                                        now
-                                        - parse_datetime(product.get("listedAt"))
-                                    ).total_seconds()
-                                    / 86400.0,
-                                ),
-                                2,
-                            )
-                            if parse_datetime(product.get("listedAt")) is not None
-                            else None
-                        ),
-                        "ageSource": (
-                            "provider_listed_at"
-                            if parse_datetime(product.get("listedAt")) is not None
-                            else None
-                        ),
-                        "sold24h": None,
-                        "sold7d": None,
-                        "avgDailySales7d": None,
-                        "salesGrowth7d": None,
-                        "trend": "UNKNOWN",
-                        "previousPrice": None,
-                        "lowestPrice7d": product.get("currentPrice"),
-                        "priceChangePercent": None,
-                        "reviews24h": None,
-                        "reviewGrowth7d": None,
-                        "creatorGrowth7d": None,
-                        "newCreators7d": None,
-                        "views7d": None,
-                        "viewsGrowth7d": None,
-                        "stockChange24h": None,
-                        "stockChange7d": None,
-                    }
-                )
+                product.update({
+                    "snapshotAt": now.isoformat(),
+                    "firstSeen": None,
+                    "observedAgeDays": None,
+                    "productAgeDays": None,
+                    "sold24h": None,
+                    "sold7d": None,
+                    "salesGrowth7d": None,
+                    "previousPrice": None,
+                    "lowestPrice7d": product.get("currentPrice"),
+                    "priceChangePercent": None,
+                    "reviewGrowth7d": None,
+                    "creatorGrowth7d": None,
+                    "stockChange24h": None,
+                    "stockChange7d": None,
+                })
+
+        # 5) Prefer direct market windows, keep own-history values as diagnostics.
+        for product in products:
+            product["snapshotAt"] = now.isoformat()
+            finalize_v6_metrics(product, now)
 
         calculate_top_product_scores(products)
 
         only_discounted = bool(input_data.get("onlyDiscounted", False))
         only_in_stock = bool(input_data.get("onlyInStock", False))
-
-        min_discount = float(input_data.get("minDiscount", 0) or 0)
-        min_sold_total = int(input_data.get("minSoldTotal", 0) or 0)
-        min_sold_24h = int(input_data.get("minSold24h", 0) or 0)
-        min_sold_7d = int(input_data.get("minSold7d", 0) or 0)
-        min_rating = float(input_data.get("minRating", 0) or 0)
-        min_commission = float(input_data.get("minCommissionPercent", 0) or 0)
-
         filtered_products = [
-            product
-            for product in products
+            product for product in products
             if product_passes_filters(
                 product,
                 only_discounted=only_discounted,
                 only_in_stock=only_in_stock,
-                min_discount=min_discount,
-                min_sold_total=min_sold_total,
-                min_sold_24h=min_sold_24h,
-                min_sold_7d=min_sold_7d,
-                min_rating=min_rating,
-                min_commission=min_commission,
+                min_discount=float(input_data.get("minDiscount", 0) or 0),
+                min_sold_total=int(input_data.get("minSoldTotal", 0) or 0),
+                min_sold_24h=int(input_data.get("minSold24h", 0) or 0),
+                min_sold_7d=int(input_data.get("minSold7d", 0) or 0),
+                min_rating=float(input_data.get("minRating", 0) or 0),
+                min_commission=float(input_data.get("minCommissionPercent", 0) or 0),
+                min_creator_count=int(input_data.get("minCreatorCount", 0) or 0),
+                min_video_views_7d=int(input_data.get("minVideoViews7d", 0) or 0),
+                min_top_score=float(input_data.get("minTopProductScore", 0) or 0),
             )
         ]
 
         sort_by = str(input_data.get("sortBy", "top_score")).strip().lower()
-
-        sorted_products = sort_products(filtered_products, sort_by)
-        output_products = sorted_products[:max_output_products]
-
+        output_products = sort_products(filtered_products, sort_by)[:max_output_products]
         for rank, product in enumerate(output_products, start=1):
             product["rank"] = rank
 
@@ -1486,52 +2243,48 @@ async def main() -> None:
             await Actor.push_data(output_products)
 
         summary = {
-            "version": "5.0-data",
+            "version": VERSION,
             "runAt": now.isoformat(),
             "region": region,
             "queries": search_queries,
+            "marketOverallTop": overall_top,
             "searchActorId": search_actor_id,
-            "productsReceived": len(all_products),
+            "marketActorId": market_actor_id,
+            "creatorsActorId": creators_actor_id,
+            "videosActorId": videos_actor_id,
+            "baseSearchRows": len(all_search_products),
+            "marketRows24h": len(market_rows_24h),
+            "marketRows7d": len(market_rows_7d),
+            "creatorRows": len(creator_rows),
+            "videoRows": len(video_rows),
             "uniqueProductsTracked": len(products),
             "productsAfterFilters": len(filtered_products),
             "productsOutput": len(output_products),
             "sortBy": sort_by,
             "trackHistory": track_history,
             "historyStoreName": history_store_name if track_history else None,
-            "priceMode": price_mode,
-            "priceDivisor": price_divisor,
-            "autoMinorUnitThreshold": auto_minor_threshold,
-            "filters": {
-                "onlyDiscounted": only_discounted,
-                "onlyInStock": only_in_stock,
-                "minDiscount": min_discount,
-                "minSoldTotal": min_sold_total,
-                "minSold24h": min_sold_24h,
-                "minSold7d": min_sold_7d,
-                "minRating": min_rating,
-                "minCommissionPercent": min_commission,
+            "marketIntelligenceEnabled": market_enabled,
+            "marketPaidAnalyticsEnabled": market_paid_analytics,
+            "creatorEnrichmentEnabled": bool(input_data.get("enableCreatorEnrichment", False)),
+            "videoEnrichmentEnabled": bool(input_data.get("enableVideoEnrichment", False)),
+            "notes": {
+                "sold24h": "Prefers market-intelligence lastDay unitsSold; falls back to own history.",
+                "sold7d": "Prefers market-intelligence last7Day unitsSold; falls back to own history.",
+                "commissionPercent": "Can come directly from market intelligence.",
+                "creatorCount": "Can come from optional analytics or observed creator rows.",
+                "videoViews7d": "Comes from optional product-video enrichment.",
+                "stock": "Never invented; remains null unless a source exposes inventory.",
+                "money": "currentPrice is local-currency search data; marketRevenueUSD* and marketAvgSellingPriceUSD* are explicitly USD.",
             },
-            "historicalMetrics": {
-                "sold24h": "Requires a suitable ~24h baseline.",
-                "sold7d": "Requires a suitable ~7d baseline.",
-                "salesGrowth7d": "Requires ~7d and ~14d baselines.",
-                "previousPrice": "Available after at least one earlier snapshot with price.",
-                "lowestPrice7d": "Calculated from stored price snapshots in the last 7 days.",
-                "creatorGrowth7d": "Requires creatorCount from provider plus a ~7d baseline.",
-                "views7d": "Requires views from provider plus a ~7d baseline.",
-                "stockChange7d": "Requires stock from provider plus a ~7d baseline.",
-            },
-            "errors": search_errors,
+            "errors": errors,
         }
-
-        await Actor.set_value("SEARCH_SUMMARY", summary)
+        await Actor.set_value("RUN_SUMMARY", summary)
 
         log.info(
             "[DONE] "
-            f"received={len(all_products)} "
-            f"unique={len(products)} "
-            f"output={len(output_products)} "
-            f"history={track_history}"
+            f"base={len(all_search_products)} market24={len(market_rows_24h)} "
+            f"market7d={len(market_rows_7d)} creators={len(creator_rows)} "
+            f"videos={len(video_rows)} unique={len(products)} output={len(output_products)}"
         )
 
 
